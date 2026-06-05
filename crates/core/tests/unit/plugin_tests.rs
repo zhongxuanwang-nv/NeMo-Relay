@@ -419,6 +419,107 @@ fn test_layer_config_preserves_multi_instance_kinds() {
 }
 
 #[test]
+fn test_typed_overlay_precedence_over_file_base() {
+    // Mirrors what `initialize_plugins` does: a discovered file base with the caller's TYPED config
+    // layered on top. Because `PluginConfig` fields are non-`Option` with concrete defaults,
+    // serializing the code layer always emits `version`/`policy`/`enabled`, so those defaults
+    // override the file base; only a component's free-form `config` body merges field-by-field.
+    let file_base = json!({
+        "version": 2,
+        "components": [{
+            "kind": "observability",
+            "enabled": false,
+            "config": { "atof": { "enabled": true, "filename": "events.jsonl" } }
+        }],
+        "policy": { "unknown_component": "error" }
+    });
+    // The caller sets only `atof.mode`; `enabled`/`policy`/`version` are left to struct defaults.
+    let code: PluginConfig = serde_json::from_value(json!({
+        "components": [{ "kind": "observability", "config": { "atof": { "mode": "overwrite" } } }]
+    }))
+    .unwrap();
+
+    let mut merged = file_base;
+    layer_config(&mut merged, serde_json::to_value(&code).unwrap());
+
+    let component = &merged["components"][0];
+    // Free-form config merges field-by-field: file keys preserved, code key added.
+    assert_eq!(component["config"]["atof"]["enabled"], json!(true));
+    assert_eq!(
+        component["config"]["atof"]["filename"],
+        json!("events.jsonl")
+    );
+    assert_eq!(component["config"]["atof"]["mode"], json!("overwrite"));
+    // The code layer's defaulted `enabled = true` wins over the file's `false`.
+    assert_eq!(component["enabled"], json!(true));
+    // Top-level `version`/`policy` revert to the code layer's defaults, not the file's values.
+    assert_eq!(merged["version"], json!(default_plugin_config_version()));
+    assert_eq!(
+        merged["policy"]["unknown_component"],
+        serde_json::to_value(default_warn()).unwrap()
+    );
+
+    // The merged document still deserializes into a `PluginConfig`, as `initialize_plugins` requires.
+    let effective: PluginConfig = serde_json::from_value(merged).unwrap();
+    assert_eq!(effective.components.len(), 1);
+    assert_eq!(effective.components[0].kind, "observability");
+}
+
+#[cfg(feature = "config-files")]
+#[test]
+fn test_load_plugin_config_files_merges_layers_and_reports_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let low = dir.path().join("low.toml");
+    let high = dir.path().join("high.toml");
+    std::fs::write(
+        &low,
+        "version = 1\n\n[[components]]\nkind = \"observability\"\nenabled = false\n\n[components.config.atof]\nfilename = \"low.jsonl\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &high,
+        "[[components]]\nkind = \"observability\"\n\n[components.config.atof]\nmode = \"overwrite\"\n",
+    )
+    .unwrap();
+
+    let (merged, sources) = load_plugin_config_files(vec![low.clone(), high.clone()])
+        .unwrap()
+        .unwrap();
+
+    let component = &merged["components"][0];
+    assert_eq!(component["kind"], json!("observability"));
+    assert_eq!(component["config"]["atof"]["filename"], json!("low.jsonl")); // from low layer
+    assert_eq!(component["config"]["atof"]["mode"], json!("overwrite")); // from high layer
+    // File-to-file layering uses the raw documents, so a key the high layer omits is NOT clobbered.
+    assert_eq!(component["enabled"], json!(false));
+    assert_eq!(sources, vec![low, high]);
+}
+
+#[cfg(feature = "config-files")]
+#[test]
+fn test_load_plugin_config_files_rejects_duplicate_kind_in_one_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dup.toml");
+    std::fs::write(
+        &path,
+        "[[components]]\nkind = \"observability\"\n\n[[components]]\nkind = \"observability\"\n",
+    )
+    .unwrap();
+
+    let err = load_plugin_config_files(vec![path]).unwrap_err();
+    assert!(matches!(err, PluginError::InvalidConfig(_)));
+    assert!(err.to_string().contains("duplicate plugin component kind"));
+}
+
+#[cfg(feature = "config-files")]
+#[test]
+fn test_load_plugin_config_files_none_when_no_files_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist.toml");
+    assert!(load_plugin_config_files(vec![missing]).unwrap().is_none());
+}
+
+#[test]
 fn test_config_report_has_errors() {
     let report = ConfigReport {
         diagnostics: vec![ConfigDiagnostic {
