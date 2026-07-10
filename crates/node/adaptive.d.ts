@@ -52,7 +52,7 @@ export interface AcgConfig {
   stability_thresholds?: AcgStabilityThresholds;
 }
 
-/** Opt-in LLM response cache (exact-match) settings. */
+/** Opt-in LLM response cache settings. */
 export interface ResponseCacheConfig {
   ttlSeconds?: number;
   /**
@@ -281,7 +281,7 @@ export declare function acgConfig(config?: AcgConfig): AcgConfig;
  * Create response-cache settings with defaults applied.
  *
  * Merges caller-supplied overrides onto the opt-in LLM response-cache config
- * shape (exact-match) used by the adaptive plugin. This is a section of
+ * shape used by the adaptive plugin. This is a section of
  * the adaptive component, not a standalone plugin kind.
  *
  * @param config - Partial response-cache settings to override.

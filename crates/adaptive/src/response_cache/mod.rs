@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Opt-in LLM response cache (exact-match): a feature of the adaptive plugin,
+//! Opt-in LLM response cache: a feature of the adaptive plugin,
 //! configured through [`crate::config::AdaptiveConfig::response_cache`].
 //!
 //! [`intercept`] holds the execution intercepts and storage rules, [`key`] the
@@ -19,7 +19,9 @@ pub(crate) mod replay;
 pub mod store;
 
 pub use crate::config::ResponseCacheConfig;
-pub use crate::response_cache::config::{BackendConfig, KEY_STRATEGY_EXACT_REQUEST};
+pub use crate::response_cache::config::{
+    BackendConfig, KEY_STRATEGY_EXACT_REQUEST, KEY_STRATEGY_LOGICAL,
+};
 pub(crate) use crate::response_cache::intercept::{make_intercept, make_stream_intercept};
 pub use crate::response_cache::mark::RESPONSE_CACHE_MARK;
 pub(crate) use crate::response_cache::store::build_store;
