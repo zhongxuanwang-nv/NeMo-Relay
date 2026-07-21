@@ -25,8 +25,8 @@ use crate::codec::openai_responses::OpenAIResponsesCodec;
 use crate::codec::traits::LlmResponseCodec;
 use crate::plugin::{
     PluginComponentSpec, PluginConfig, PluginRegistrationContext, clear_plugin_configuration,
-    ensure_builtin_plugins_registered, initialize_plugins, list_plugin_kinds,
-    validate_plugin_config,
+    ensure_builtin_plugins_registered, initialize_plugins_exact as initialize_plugins,
+    list_plugin_kinds, validate_plugin_config,
 };
 use nemo_relay::observability::atif::{AtifAgentInfo, AtifExporter};
 use nemo_relay::observability::atof::{AtofExporter, AtofExporterConfig};
@@ -586,11 +586,11 @@ fn sanitized_pii_never_reaches_subscribers_or_exporters() {
 
     futures::executor::block_on(initialize_plugins(plugin_config(json!({
         "mode": "builtin",
-        "codec": "openai_chat",
+        "codec": "openai_responses",
         "input": true,
         "output": true,
-        "tool_input": false,
-        "tool_output": false,
+        "tool_input": true,
+        "tool_output": true,
         "builtin": {
             "action": "redact",
             "detector": "email"
@@ -646,6 +646,40 @@ fn sanitized_pii_never_reaches_subscribers_or_exporters() {
             .build(),
     )
     .unwrap();
+    let tool = tool_call(
+        ToolCallParams::builder()
+            .name("email_lookup")
+            .args(json!({"email": raw_pii}))
+            .build(),
+    )
+    .unwrap();
+    tool_call_end(
+        ToolCallEndParams::builder()
+            .handle(&tool)
+            .result(json!({"owner": raw_pii}))
+            .build(),
+    )
+    .unwrap();
+    futures::executor::block_on(llm_call_execute(
+        LlmCallExecuteParams::builder()
+            .name("openai")
+            .request(LlmRequest {
+                headers: serde_json::Map::new(),
+                content: json!({"model": "gpt-test", "input": raw_pii}),
+            })
+            .func(noop_openai_chat_exec_fn(json!({
+                "id": "resp_pii_regression",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": raw_pii}]
+                }]
+            })))
+            .response_codec(Arc::new(OpenAIResponsesCodec))
+            .build(),
+    ))
+    .unwrap();
     event(
         EmitMarkEventParams::builder()
             .name("hermes.checkpoint")
@@ -683,6 +717,10 @@ fn sanitized_pii_never_reaches_subscribers_or_exporters() {
         assert!(
             !output.contains(raw_pii),
             "raw PII leaked through {surface}: {output}"
+        );
+        assert!(
+            output.contains("[REDACTED]"),
+            "redacted payload was missing from {surface}: {output}"
         );
     }
 
