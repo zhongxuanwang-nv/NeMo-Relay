@@ -710,6 +710,7 @@ async fn logical_strategy_reuses_across_reworded_tool_descriptions() {
     // `logical` must be accepted by validation (activate_cache asserts no
     // diagnostics) and must reuse across a reworded tool description end-to-end.
     activate_cache(ResponseCacheConfig {
+        namespace: "logical-key-integration-test".to_string(),
         key_strategy: "logical".to_string(),
         ..ResponseCacheConfig::default()
     })
