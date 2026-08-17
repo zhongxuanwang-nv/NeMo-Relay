@@ -14,23 +14,27 @@ use toml_edit::{DocumentMut, InlineTable, Item, Table, Value as TomlValue, value
 
 use crate::agents::CodingAgent;
 use crate::configuration::{BOOTSTRAP_CLIENT_TOKEN_HEADER, BootstrapChallengeKey, RELAY_PLUGIN_ID};
+#[cfg(test)]
 use crate::hooks::generated_hooks;
 #[cfg(test)]
 use crate::hooks::merge_hooks;
 
 use super::app_server::{CodexAppServerClient, CodexHookMetadata, CodexHooksClient};
 use crate::agents::shared::host::{
-    atomic_write, atomic_write_private, current_exe, ensure_table, home_dir, read_json_object,
-    shell_quote, write_json,
+    atomic_write_private, current_exe, ensure_table, home_dir, read_json_object, shell_quote,
+    write_json_preserving_symlink,
 };
 use crate::filesystem::{
-    FileSnapshot, backup, backup_path, remove_backup, restore_file_snapshot, snapshot_optional_file,
+    FileSnapshot, atomic_write_preserving_symlink, backup, backup_path, ensure_symlink_path,
+    remove_backup, remove_file_preserving_symlink, restore_file_snapshot, snapshot_optional_file,
 };
 use crate::process::{portable_executable_path, shell_quote_arg_for_platform};
 
 pub(crate) const CODEX_PLUGIN_ID: &str = RELAY_PLUGIN_ID;
 pub(crate) const CODEX_PLUGIN_HOOK_KEY_PREFIX: &str =
     "nemo-relay-plugin@nemo-relay-local:hooks/hooks.json:";
+const ABSENT_CONFIG_BACKUP_KEY: &str = "__nemo_relay_original_config_absent";
+const CONFIG_SYMLINK_TARGET_BACKUP_KEY: &str = "__nemo_relay_original_config_symlink_target";
 
 pub(crate) struct CodexSetupSnapshot {
     files: Vec<FileSnapshot>,
@@ -109,11 +113,11 @@ pub(crate) fn install_codex_with_generation(
 
 pub(crate) fn install_codex_with_trust<F>(
     gateway_url: &str,
-    expected_command: &str,
+    expected_commands: &crate::hooks::GeneratedHookCommands,
     trust_hooks: F,
 ) -> Result<ExitCode, String>
 where
-    F: FnOnce(&Path, &Path, &str) -> Result<(), String>,
+    F: FnOnce(&Path, &Path, &crate::hooks::GeneratedHookCommands) -> Result<(), String>,
 {
     let home = home_dir()?;
     let codex_dir = codex_home_dir()?;
@@ -125,7 +129,7 @@ where
     let snapshots = codex_install_snapshots(&config_path, &hooks_path)?;
     let install_result = remove_legacy_codex_hooks(&hooks_path)
         .and_then(|()| install_codex_config(&config_path, gateway_url))
-        .and_then(|()| trust_hooks(&home, &config_path, expected_command));
+        .and_then(|()| trust_hooks(&home, &config_path, expected_commands));
     if let Err(error) = install_result {
         return match restore_codex_install_snapshots(&snapshots) {
             Ok(()) => Err(error),
@@ -257,9 +261,9 @@ pub(crate) fn codex_hook_trust_report_with_generation(
 pub(crate) fn codex_hook_trust_report_with_client(
     client: &mut dyn CodexHooksClient,
     cwd: &Path,
-    expected_command: &str,
+    expected_commands: &crate::hooks::GeneratedHookCommands,
 ) -> Result<CodexHookTrustReport, String> {
-    let hooks = relay_codex_hooks(client, cwd, expected_command)?;
+    let hooks = relay_codex_hooks(client, cwd, expected_commands)?;
     Ok(codex_hook_trust_report_for(&hooks))
 }
 
@@ -267,9 +271,9 @@ pub(crate) fn auto_trust_codex_hooks(
     client: &mut dyn CodexHooksClient,
     cwd: &Path,
     config_path: &Path,
-    expected_command: &str,
+    expected_commands: &crate::hooks::GeneratedHookCommands,
 ) -> Result<(), String> {
-    let hooks = relay_codex_hooks(client, cwd, expected_command)?;
+    let hooks = relay_codex_hooks(client, cwd, expected_commands)?;
     let before = codex_hook_trust_report_for(&hooks);
     if !before.missing_required.is_empty() || !before.duplicate_required.is_empty() {
         return Err(format!(
@@ -280,7 +284,7 @@ pub(crate) fn auto_trust_codex_hooks(
     }
     let state = snapshot_hook_trust_state(config_path, &hooks)?;
     let trust_result = client.trust_hooks(&hooks).and_then(|()| {
-        let verified_hooks = relay_codex_hooks(client, cwd, expected_command)?;
+        let verified_hooks = relay_codex_hooks(client, cwd, expected_commands)?;
         let verified = codex_hook_trust_report_for(&verified_hooks);
         let unverified_targets = hooks
             .iter()
@@ -308,7 +312,7 @@ pub(crate) fn auto_trust_codex_hooks(
         return restore_hook_trust_after_failure(
             client,
             cwd,
-            expected_command,
+            expected_commands,
             &hooks,
             &state,
             error,
@@ -320,21 +324,28 @@ pub(crate) fn auto_trust_codex_hooks(
 fn relay_codex_hooks(
     client: &mut dyn CodexHooksClient,
     cwd: &Path,
-    expected_command: &str,
+    expected_commands: &crate::hooks::GeneratedHookCommands,
 ) -> Result<Vec<CodexHookMetadata>, String> {
     let hooks = relay_codex_plugin_hooks(client, cwd)?
         .into_iter()
-        .filter(|hook| hook.command.as_deref() == Some(expected_command))
+        .filter(|hook| {
+            expected_codex_hook_command(expected_commands, &hook.event_name).is_some_and(
+                |expected| {
+                    hook.command.as_deref() == Some(expected)
+                        || hook.command.as_deref() == expected_commands.legacy()
+                },
+            )
+        })
         .collect::<Vec<_>>();
-    validate_loaded_hook_sources(&hooks, expected_command)?;
+    validate_loaded_hook_sources(&hooks, expected_commands)?;
     Ok(hooks)
 }
 
 fn validate_loaded_hook_sources(
     hooks: &[CodexHookMetadata],
-    expected_command: &str,
+    expected_commands: &crate::hooks::GeneratedHookCommands,
 ) -> Result<(), String> {
-    let expected = generated_hooks(CodingAgent::Codex, expected_command);
+    let expected = crate::hooks::generated_policy_hooks(CodingAgent::Codex, expected_commands);
     let sources = hooks
         .iter()
         .map(|hook| hook.source_path.as_str())
@@ -538,7 +549,7 @@ fn verify_restored_hook_trust(
 fn restore_hook_trust_after_failure(
     client: &mut dyn CodexHooksClient,
     cwd: &Path,
-    expected_command: &str,
+    expected_commands: &crate::hooks::GeneratedHookCommands,
     before: &[CodexHookMetadata],
     state: &[(String, Option<Value>)],
     original_error: String,
@@ -548,7 +559,7 @@ fn restore_hook_trust_after_failure(
             "{original_error}; additionally failed to restore Codex hook trust: {rollback_error}"
         ));
     }
-    let restored = relay_codex_hooks(client, cwd, expected_command).map_err(|rollback_error| {
+    let restored = relay_codex_hooks(client, cwd, expected_commands).map_err(|rollback_error| {
         format!(
             "{original_error}; additionally failed to verify restored Codex hook trust: {rollback_error}"
         )
@@ -569,14 +580,16 @@ fn restore_hook_trust_after_failure(
 }
 
 #[cfg(test)]
-pub(crate) fn expected_plugin_hook_command(plugin_hooks_path: &Path) -> Result<String, String> {
+pub(crate) fn expected_plugin_hook_command(
+    plugin_hooks_path: &Path,
+) -> Result<crate::hooks::GeneratedHookCommands, String> {
     expected_plugin_hook_command_with_token(plugin_hooks_path, None)
 }
 
 fn expected_plugin_hook_command_with_token(
     plugin_hooks_path: &Path,
     generation_token: Option<&str>,
-) -> Result<String, String> {
+) -> Result<crate::hooks::GeneratedHookCommands, String> {
     let relay = current_exe()?;
     let relay = relay.canonicalize().unwrap_or(relay);
     let relay = portable_executable_path(relay);
@@ -614,9 +627,12 @@ fn plugin_generation_file(plugin_hooks_path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-fn validate_plugin_hooks(path: &Path, expected_command: &str) -> Result<(), String> {
+fn validate_plugin_hooks(
+    path: &Path,
+    expected_commands: &crate::hooks::GeneratedHookCommands,
+) -> Result<(), String> {
     let actual = read_json_object(path)?;
-    let expected = generated_hooks(CodingAgent::Codex, expected_command);
+    let expected = crate::hooks::generated_policy_hooks(CodingAgent::Codex, expected_commands);
     if actual == expected {
         Ok(())
     } else {
@@ -674,12 +690,24 @@ fn is_generated_codex_hook_event(event: &str) -> bool {
         .any(|expected| normalize_hook_event(expected) == normalized)
 }
 
-fn normalize_hook_event(event: &str) -> String {
+pub(crate) fn normalize_hook_event(event: &str) -> String {
     event
         .chars()
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+pub(crate) fn expected_codex_hook_command<'a>(
+    commands: &'a crate::hooks::GeneratedHookCommands,
+    event: &str,
+) -> Option<&'a str> {
+    let normalized = normalize_hook_event(event);
+    CodingAgent::Codex
+        .hook_events()
+        .iter()
+        .find(|expected| normalize_hook_event(expected) == normalized)
+        .map(|event| commands.for_event(event))
 }
 
 fn codex_install_snapshots(
@@ -707,6 +735,57 @@ fn restore_codex_install_snapshots(snapshots: &[FileSnapshot]) -> Result<(), Str
     } else {
         Err(errors.join("; "))
     }
+}
+
+fn codex_config_backup_symlink_target(path: &Path) -> Result<Option<PathBuf>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::read_link(path)
+            .map(Some)
+            .map_err(|error| format!("failed to read symlink {}: {error}", path.display())),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "failed to inspect {} for symlink metadata: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn codex_backup_symlink_target(backup: &DocumentMut) -> Option<PathBuf> {
+    backup
+        .get(CONFIG_SYMLINK_TARGET_BACKUP_KEY)
+        .and_then(Item::as_value)
+        .and_then(TomlValue::as_str)
+        .map(PathBuf::from)
+}
+
+fn record_codex_config_backup_symlink_target(
+    backup: &mut DocumentMut,
+    symlink_target: &Path,
+) -> Result<(), String> {
+    let Some(target) = symlink_target.to_str() else {
+        return Ok(());
+    };
+    backup[CONFIG_SYMLINK_TARGET_BACKUP_KEY] = value(target);
+    Ok(())
+}
+
+fn write_initial_codex_config_backup(path: &Path, raw: &str) -> Result<(), String> {
+    let Some(symlink_target) = codex_config_backup_symlink_target(path)? else {
+        if !path.exists() {
+            return Ok(());
+        }
+        return atomic_write_private(&backup_path(path), raw.as_bytes());
+    };
+
+    let mut backup = raw
+        .parse::<DocumentMut>()
+        .map_err(|error| format!("invalid TOML in {}: {error}", path.display()))?;
+    if path_is_dangling_symlink(path)? {
+        backup[ABSENT_CONFIG_BACKUP_KEY] = value(true);
+    }
+    record_codex_config_backup_symlink_target(&mut backup, &symlink_target)?;
+    atomic_write_private(&backup_path(path), backup.to_string().as_bytes())
 }
 
 pub(crate) fn prepare_codex_config(path: &Path) -> Result<(), String> {
@@ -790,10 +869,7 @@ fn refresh_codex_config_backup(
     let previous = read_codex_backup_doc_for_refresh(path)?
         .map(|backup| sanitize_codex_backup_doc(backup, gateway_url, Some(challenge)));
     if previous.is_none() && !has_managed_proof {
-        if !path.exists() {
-            return Ok(());
-        }
-        return atomic_write_private(&backup_path(path), raw.as_bytes());
+        return write_initial_codex_config_backup(path, raw);
     }
 
     let empty = DocumentMut::new();
@@ -806,6 +882,12 @@ fn refresh_codex_config_backup(
     if let Some(provider) = preserved_provider {
         ensure_table(&mut baseline, "model_providers")
             .insert("nemo-relay-openai", Item::Table(provider));
+    }
+    if codex_backup_marks_original_config_absent(previous) {
+        baseline[ABSENT_CONFIG_BACKUP_KEY] = value(true);
+    }
+    if let Some(symlink_target) = codex_backup_symlink_target(previous) {
+        record_codex_config_backup_symlink_target(&mut baseline, &symlink_target)?;
     }
     remove_empty_table(&mut baseline, "model_providers");
     remove_empty_table(&mut baseline, "features");
@@ -1139,6 +1221,10 @@ pub(crate) fn uninstall_codex_config(
     let challenge = BootstrapChallengeKey::load_existing().map_err(|error| error.to_string())?;
     let backup_doc = read_codex_backup_doc(path)?
         .map(|backup| sanitize_codex_backup_doc(backup, gateway_url, challenge.as_ref()));
+    let restore_dangling_symlink = backup_doc
+        .as_ref()
+        .is_some_and(codex_backup_marks_original_config_absent);
+    let original_symlink_target = backup_doc.as_ref().and_then(codex_backup_symlink_target);
     let preserved_provider = codex_extended_provider_without_proof(&doc, gateway_url);
     let provider_is_managed = codex_provider_item_is_managed(&doc, gateway_url);
     match backup_doc.as_ref() {
@@ -1165,7 +1251,24 @@ pub(crate) fn uninstall_codex_config(
 
     remove_empty_table(&mut doc, "model_providers");
     remove_empty_table(&mut doc, "features");
-    atomic_write(path, doc.to_string().as_bytes())?;
+    if let Some(target) = original_symlink_target.as_deref() {
+        ensure_symlink_path(path, target)?;
+    }
+    if restore_dangling_symlink && doc.as_table().is_empty() {
+        if original_symlink_target.is_some() {
+            remove_file_preserving_symlink(path)?;
+        } else {
+            fs::remove_file(path)
+                .or_else(|error| {
+                    (error.kind() == std::io::ErrorKind::NotFound)
+                        .then_some(())
+                        .ok_or(error)
+                })
+                .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
+        }
+    } else {
+        atomic_write_preserving_symlink(path, doc.to_string().as_bytes())?;
+    }
     remove_backup(path)
 }
 
@@ -1229,7 +1332,7 @@ pub(crate) fn remove_legacy_codex_hooks(path: &Path) -> Result<(), String> {
         return Ok(());
     }
     backup(path)?;
-    write_json(path, &updated)
+    write_json_preserving_symlink(path, &updated)
 }
 
 #[cfg(test)]
@@ -1254,7 +1357,7 @@ pub(crate) fn install_codex_hooks(path: &Path, gateway_url: &str) -> Result<(), 
     let bytes = serde_json::to_vec_pretty(&merged).map_err(|error| error.to_string())?;
     let mut output = bytes;
     output.push(b'\n');
-    atomic_write(path, &output)
+    atomic_write_preserving_symlink(path, &output)
 }
 
 pub(crate) fn uninstall_codex_hooks(path: &Path, _gateway_url: &str) -> Result<bool, String> {
@@ -1265,8 +1368,28 @@ pub(crate) fn uninstall_codex_hooks(path: &Path, _gateway_url: &str) -> Result<b
     let relay = current_exe()?;
     remove_managed_codex_hook_groups(&mut value, &relay, None);
     let has_remaining_hooks = hook_config_has_hook_groups(&value);
-    write_json(path, &value)?;
+    write_json_preserving_symlink(path, &value)?;
     Ok(has_remaining_hooks)
+}
+
+fn path_is_dangling_symlink(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(!path.exists()),
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "failed to inspect {} for symlink metadata: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn codex_backup_marks_original_config_absent(backup: &DocumentMut) -> bool {
+    backup
+        .get(ABSENT_CONFIG_BACKUP_KEY)
+        .and_then(Item::as_value)
+        .and_then(TomlValue::as_bool)
+        == Some(true)
 }
 
 pub(crate) fn remove_managed_codex_hook_groups(
@@ -1635,7 +1758,7 @@ pub(crate) fn codex_hooks_installed_with_generation(
     generation_token: Option<&str>,
 ) -> Result<bool, String> {
     let value = read_json_object(path)?;
-    let generated = generated_hooks(
+    let generated = crate::hooks::generated_policy_hooks(
         CodingAgent::Codex,
         &expected_plugin_hook_command_with_token(path, generation_token)?,
     );
@@ -1660,8 +1783,8 @@ pub(crate) fn codex_plugin_hook_command(
     relay: &Path,
     generation: &Path,
     generation_token: &str,
-) -> Result<String, String> {
-    crate::hooks::persistent_hook_forward_command(
+) -> Result<crate::hooks::GeneratedHookCommands, String> {
+    crate::hooks::persistent_hook_forward_commands(
         relay,
         CodingAgent::Codex,
         generation,
@@ -1675,8 +1798,8 @@ pub(crate) fn codex_plugin_hook_command_for_platform(
     generation: &Path,
     generation_token: &str,
     windows: bool,
-) -> String {
-    crate::hooks::persistent_hook_forward_command_for_platform(
+) -> crate::hooks::GeneratedHookCommands {
+    crate::hooks::persistent_hook_forward_commands_for_platform(
         relay,
         CodingAgent::Codex,
         generation,

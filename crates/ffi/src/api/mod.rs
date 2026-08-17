@@ -99,6 +99,53 @@ fn tokio_runtime() -> &'static Runtime {
     })
 }
 
+/// Prevents a closed Unix worker socket from terminating the embedding process.
+///
+/// Rust executables configure `SIGPIPE` during startup, but this crate is also
+/// loaded as a library by Go. On Linux, that process-level initialization does
+/// not run for a `cdylib`, so socket writes after a worker exits can otherwise
+/// terminate the host instead of returning `EPIPE`.
+#[cfg(target_os = "linux")]
+fn ignore_sigpipe() {
+    static INITIALIZED: OnceLock<()> = OnceLock::new();
+    INITIALIZED.get_or_init(|| unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ignore_sigpipe() {}
+
+/// Initializes the Go binding runtime and installs default operational logging.
+///
+/// Logging configuration is resolved from `NEMO_RELAY_LOG`,
+/// `NEMO_RELAY_LOG_STDERR_FORMAT`, or `NEMO_RELAY_LOG_CONFIG_PATH`, with built-in defaults when
+/// none are set. Repeated initialization is a no-op.
+#[unsafe(no_mangle)]
+pub extern "C" fn nemo_relay_initialize_default_logging() -> NemoRelayStatus {
+    clear_last_error();
+    ignore_sigpipe();
+    let result = nemo_relay::shared_runtime::initialize_shared_runtime_binding("go")
+        .and_then(|()| nemo_relay::logging::initialize_default_logging());
+    match result {
+        Ok(()) => NemoRelayStatus::Ok,
+        Err(error) => status_from_error(&error),
+    }
+}
+
+/// Shuts down and releases the default operational logging runtime.
+///
+/// Pending file-sink records are drained before this function returns. Repeated shutdown is a
+/// no-op.
+#[unsafe(no_mangle)]
+pub extern "C" fn nemo_relay_shutdown_default_logging() -> NemoRelayStatus {
+    clear_last_error();
+    match nemo_relay::logging::shutdown_default_logging() {
+        Ok(()) => NemoRelayStatus::Ok,
+        Err(error) => status_from_error(&error),
+    }
+}
+
 fn block_on_sync_ffi<T, F>(future: F) -> FlowResult<T>
 where
     T: Send,

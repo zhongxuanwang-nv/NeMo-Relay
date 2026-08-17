@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::api::event::{Event, ScopeCategory};
+use crate::api::event::{Event, EventSanitizeFields, ScopeCategory};
 use crate::api::llm::LlmRequest;
 use crate::api::registry::Guardrail;
 use crate::api::runtime::global_context;
+use crate::api::runtime::scope_stack::traceparent_for_llm;
 use crate::api::runtime::{
     EventSanitizeFn, EventSubscriberFn, NemoRelayContextState, ScopeStackHandle,
 };
@@ -25,6 +26,8 @@ use crate::shared_runtime::ensure_process_runtime_owner;
 pub const DYNAMO_SESSION_ID_HEADER_KEY: &str = "x-dynamo-session-id";
 /// Header carrying the parent Dynamo agent session ID.
 pub const DYNAMO_PARENT_SESSION_ID_HEADER_KEY: &str = "x-dynamo-parent-session-id";
+/// Header carrying the W3C trace context for an outbound provider request.
+pub const TRACEPARENT_HEADER_KEY: &str = "traceparent";
 
 pub(crate) fn resolve_parent_uuid(parent: Option<&ScopeHandle>) -> Option<Uuid> {
     Some(
@@ -61,9 +64,13 @@ pub(crate) fn snapshot_event_sanitizers(
                 log::error!(
                     target: "nemo_relay.runtime",
                     event = "event_sanitizer_snapshot_failed";
-                    "Event sanitizer snapshot failed open because the scope stack lock is poisoned; publishing without event sanitizers: {error}"
+                    "Event sanitizer snapshot failed; clearing observability fields: {error}"
                 );
-                return None;
+                return Some(vec![Guardrail::new(
+                    "event-sanitizer-snapshot-failure",
+                    i32::MIN,
+                    Arc::new(|_, _| Box::pin(async { Ok(EventSanitizeFields::default()) })),
+                )]);
             }
         };
         let context = global_context();
@@ -73,9 +80,13 @@ pub(crate) fn snapshot_event_sanitizers(
                 log::error!(
                     target: "nemo_relay.runtime",
                     event = "event_sanitizer_snapshot_failed";
-                    "Event sanitizer snapshot failed open because the runtime context lock is poisoned; publishing without event sanitizers: {error}"
+                    "Event sanitizer snapshot failed; clearing observability fields: {error}"
                 );
-                return None;
+                return Some(vec![Guardrail::new(
+                    "event-sanitizer-snapshot-failure",
+                    i32::MIN,
+                    Arc::new(|_, _| Box::pin(async { Ok(EventSanitizeFields::default()) })),
+                )]);
             }
         };
         match &event {
@@ -174,6 +185,21 @@ pub(crate) fn inject_dynamo_session_ids(request: &mut LlmRequest) {
     }
 }
 
+pub(crate) fn inject_traceparent_value(request: &mut LlmRequest, value: String) {
+    request
+        .headers
+        .retain(|key, _| !key.eq_ignore_ascii_case(TRACEPARENT_HEADER_KEY));
+    request
+        .headers
+        .insert(TRACEPARENT_HEADER_KEY.to_string(), Json::String(value));
+}
+
+pub(crate) fn inject_traceparent(request: &mut LlmRequest, parent_uuid: Uuid) -> Result<()> {
+    let value = traceparent_for_llm(parent_uuid)?;
+    inject_traceparent_value(request, value);
+    Ok(())
+}
+
 pub(crate) fn metadata_with_otel_status(
     metadata: Option<Json>,
     status_code: &'static str,
@@ -202,6 +228,21 @@ pub(crate) fn metadata_with_otel_status(
         && let Some(Json::Object(metadata)) = metadata.as_mut()
     {
         metadata.remove("otel.status_description");
+    }
+    metadata
+}
+
+pub(crate) fn metadata_with_otel_error(metadata: Option<Json>, error: &FlowError) -> Option<Json> {
+    let mut metadata = metadata_with_otel_status(metadata, "ERROR", Some(error.to_string()));
+    if let Some(Json::Object(metadata)) = metadata.as_mut() {
+        metadata
+            .entry("error.type".to_string())
+            .or_insert_with(|| Json::String(error.otel_error_type().to_string()));
+        if let Some(exception_type) = error.exception_type() {
+            metadata
+                .entry("exception.type".to_string())
+                .or_insert_with(|| Json::String(exception_type.to_string()));
+        }
     }
     metadata
 }

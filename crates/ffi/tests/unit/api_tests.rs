@@ -46,6 +46,17 @@ static COLLECTED_CHUNKS: OnceLock<Mutex<Vec<Json>>> = OnceLock::new();
 static FINALIZER_CALLS: OnceLock<Mutex<usize>> = OnceLock::new();
 static PLUGIN_FREES: OnceLock<Mutex<usize>> = OnceLock::new();
 
+#[track_caller]
+fn assert_native_status(actual: NemoRelayStatus, expected: NemoRelayStatus) {
+    assert_eq!(actual, expected);
+}
+
+macro_rules! assert_status {
+    ($actual:expr, $expected:expr $(,)?) => {
+        assert_native_status($actual, $expected)
+    };
+}
+
 fn event_log() -> &'static Mutex<Vec<Json>> {
     EVENT_LOG.get_or_init(|| Mutex::new(Vec::new()))
 }
@@ -233,6 +244,19 @@ unsafe fn fresh_scope_stack() -> *mut FfiScopeStack {
 }
 
 #[test]
+fn default_logging_shutdown_is_idempotent() {
+    let _guard = lock_unpoisoned(&TEST_MUTEX);
+    assert_status!(
+        api::nemo_relay_shutdown_default_logging(),
+        NemoRelayStatus::Ok
+    );
+    assert_status!(
+        api::nemo_relay_shutdown_default_logging(),
+        NemoRelayStatus::Ok
+    );
+}
+
+#[test]
 fn propagation_context_json_round_trips_through_the_ffi() {
     let _guard = lock_unpoisoned(&TEST_MUTEX);
     let root_uuid = "018f13f0-7c1a-7a80-8000-000000000001";
@@ -365,7 +389,9 @@ unsafe extern "C" fn tool_exec_cb(
     )
     .unwrap();
     args["executed"] = json!(true);
-    CString::new(args.to_string()).unwrap().into_raw()
+    CString::new(json!({ "result": args, "annotation": { "source": "ffi" } }).to_string())
+        .unwrap()
+        .into_raw()
 }
 
 unsafe extern "C" fn tool_exec_fail_cb(
@@ -386,12 +412,11 @@ unsafe extern "C" fn tool_exec_intercept_cb(
     if result_ptr.is_null() {
         return ptr::null_mut();
     }
-    let result: Json =
+    let mut result: Json =
         serde_json::from_str(unsafe { CStr::from_ptr(result_ptr) }.to_str().unwrap()).unwrap();
     unsafe { nemo_relay_string_free(result_ptr) };
-    CString::new(json!({ "result": result, "pending_marks": [] }).to_string())
-        .unwrap()
-        .into_raw()
+    result["pending_marks"] = json!([]);
+    CString::new(result.to_string()).unwrap().into_raw()
 }
 
 unsafe extern "C" fn llm_request_cb(

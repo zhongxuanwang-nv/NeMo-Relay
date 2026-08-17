@@ -24,13 +24,16 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Mapping, Sequence
 from datetime import datetime
-from typing import ClassVar, Literal, Optional, TypeAlias, TypedDict
+from typing import ClassVar, Generic, Literal, Optional, TypeAlias, TypedDict, TypeVar
 
 _JsonPrimitive: TypeAlias = str | int | float | bool | None
 _JsonValue: TypeAlias = _JsonPrimitive | list["_JsonValue"] | dict[str, "_JsonValue"]
 _JsonObject: TypeAlias = dict[str, _JsonValue]
 _Json: TypeAlias = _JsonValue
 _MessageContent: TypeAlias = str | Sequence[Mapping[str, _JsonValue]]
+_TToolResult = TypeVar("_TToolResult")
+
+def _shutdown_default_logging() -> None: ...
 
 class _EventSanitizeFields(TypedDict):
     data: _Json | None
@@ -54,7 +57,7 @@ _EventSanitizeGuardrail: TypeAlias = Callable[
 _LlmConditionalExecutionGuardrail: TypeAlias = Callable[["LLMRequest"], Optional[str] | Awaitable[Optional[str]]]
 _ToolRequestIntercept: TypeAlias = Callable[[str, _Json], _Json | Awaitable[_Json]]
 _ToolExecutionIntercept: TypeAlias = Callable[
-    [str, _Json, Callable[[_Json], Awaitable[_Json]]],
+    [str, _Json, Callable[[_Json], Awaitable["ToolExecutionResult[_Json]"]]],
     "ToolExecutionInterceptOutcome | Awaitable[ToolExecutionInterceptOutcome]",
 ]
 _LlmRequestIntercept: TypeAlias = Callable[
@@ -469,10 +472,22 @@ class LLMRequestInterceptOutcome:
         """Return ordered plugin-neutral optimization contribution objects."""
         ...
 
+class ToolExecutionResult(Generic[_TToolResult]):
+    """Canonical application-visible result of tool execution.
+
+    ``result`` is owned by the application. ``annotation`` is an optional opaque
+    adjacent metadata value that Relay transports without interpretation.
+    """
+    def __init__(self, result: _TToolResult, annotation: _Json | None = ...) -> None: ...
+    @property
+    def result(self) -> _TToolResult: ...
+    @property
+    def annotation(self) -> _Json | None: ...
+
 class ToolExecutionInterceptOutcome:
     """Canonical result returned by a tool execution intercept.
 
-    ``result`` is passed to the remaining middleware and application.
+    ``result`` and ``annotation`` are passed to the remaining middleware and application.
     ``pending_marks`` are Relay-owned lifecycle metadata emitted after the
     tool-end event and are not included in the application-visible result.
     """
@@ -480,9 +495,13 @@ class ToolExecutionInterceptOutcome:
         self,
         result: _Json,
         pending_marks: list[PendingMarkSpec] = ...,
+        *,
+        annotation: _Json | None = ...,
     ) -> None: ...
     @property
     def result(self) -> _Json: ...
+    @property
+    def annotation(self) -> _Json | None: ...
     @property
     def pending_marks(self) -> list[PendingMarkSpec]: ...
 
@@ -1155,6 +1174,46 @@ class AnthropicMessagesCodec:
         """Decode an Anthropic response into a normalized response view."""
         ...
 
+class OCIGenAIChatCodec:
+    """Built-in codec for OCI Generative AI chat requests and responses.
+
+    Summary:
+        Native codec bridge for OCI Generative AI chat payloads.
+    """
+
+    def __init__(self) -> None:
+        """Create an OCI Generative AI chat codec."""
+        ...
+    def decode(self, request: LLMRequest) -> AnnotatedLLMRequest:
+        """Decode an OCI GenAI chat request into a normalized request view."""
+        ...
+    def encode(self, annotated: AnnotatedLLMRequest, original: LLMRequest) -> LLMRequest:
+        """Encode a normalized request back into OCI GenAI chat shape."""
+        ...
+    def decode_response(self, response: _Json) -> AnnotatedLLMResponse:
+        """Decode an OCI GenAI chat response into a normalized response view."""
+        ...
+
+class GeminiGenerateContentCodec:
+    """Built-in codec for Gemini generateContent requests and responses.
+
+    Summary:
+        Native codec bridge for Gemini generateContent payloads.
+    """
+
+    def __init__(self) -> None:
+        """Create a Gemini generateContent codec."""
+        ...
+    def decode(self, request: LLMRequest) -> AnnotatedLLMRequest:
+        """Decode a Gemini generateContent request into a normalized request view."""
+        ...
+    def encode(self, annotated: AnnotatedLLMRequest, original: LLMRequest) -> LLMRequest:
+        """Encode a normalized request back into Gemini generateContent shape."""
+        ...
+    def decode_response(self, response: _Json) -> AnnotatedLLMResponse:
+        """Decode a Gemini response into a normalized response view."""
+        ...
+
 class AdaptiveRuntime:
     """Hosted adaptive runtime bridge implemented by the native extension.
 
@@ -1271,6 +1330,9 @@ class PropagationContext:
     def to_json(self) -> str:
         """Serialize this context to the Relay JSON wire format."""
         ...
+    def to_traceparent(self) -> str:
+        """Convert this rooted context to a W3C traceparent value."""
+        ...
     @staticmethod
     def from_json(value: str) -> PropagationContext:
         """Deserialize and validate a Relay JSON wire context."""
@@ -1278,6 +1340,7 @@ class PropagationContext:
 
 def capture_propagation_context() -> PropagationContext: ...
 def capture_propagation_context_with_root(root_uuid: str | None) -> PropagationContext: ...
+def capture_traceparent() -> str: ...
 def create_scope_stack_from_propagation(context: PropagationContext) -> ScopeStack: ...
 
 class _ThreadScopeStackBinding: ...
@@ -1448,7 +1511,7 @@ def tool_call(
 
 def tool_call_end(
     handle: ToolHandle,
-    result: _Json,
+    result: ToolExecutionResult[_Json],
     *,
     data: _Json | None = None,
     metadata: _Json | None = None,
@@ -1458,8 +1521,9 @@ def tool_call_end(
 
     Args:
         handle: Tool handle returned by ``tool_call``.
-        result: JSON-compatible tool result recorded on the end event after
-            sanitize-response guardrails unless it sanitizes to JSON null.
+        result: Canonical tool result. Its ``result`` is recorded on the end
+            event after sanitize-response guardrails, and its opaque
+            ``annotation`` is recorded in the tool category profile.
         data: Optional JSON payload used when the sanitized result is JSON null.
         metadata: Optional JSON metadata recorded on the end event.
         timestamp: Optional timezone-aware datetime recorded on the end event.
@@ -1477,19 +1541,20 @@ def tool_call_end(
 def tool_call_execute(
     name: str,
     args: _Json,
-    func: Callable[[_Json], Awaitable[_Json]],
+    func: Callable[[_Json], ToolExecutionResult[_Json] | Awaitable[ToolExecutionResult[_Json]]],
     **kwargs: object,
-) -> Awaitable[_Json]:
+) -> Awaitable[ToolExecutionResult[_Json]]:
     """Execute a tool through the managed native middleware pipeline.
 
     Args:
         name: Tool name.
         args: Initial JSON-compatible tool arguments.
-        func: Awaitable tool implementation called with final arguments.
+        func: Synchronous or asynchronous tool implementation called with final
+            arguments. It must return ``ToolExecutionResult``.
         **kwargs: Optional parent handle, attributes, data, and metadata.
 
     Returns:
-        Awaitable that resolves to the JSON-compatible tool result.
+        Awaitable that resolves to the canonical tool result.
 
     Exceptional flow:
         Conditional guardrails may reject execution. Callback and native errors
@@ -1861,8 +1926,8 @@ def register_tool_execution_intercept(name: str, priority: int, callable: _ToolE
         priority: Execution order; lower values run first.
         callable: Middleware callback returning
             ``ToolExecutionInterceptOutcome``. It may call or short-circuit
-            ``next``; ``next`` resolves to the raw downstream result while
-            Relay retains downstream pending marks.
+            ``next``; ``next`` resolves to the canonical downstream
+            ``ToolExecutionResult`` while Relay retains downstream pending marks.
 
     Returns:
         ``None``.
@@ -1976,7 +2041,7 @@ def deregister_subscriber(name: str) -> bool:
     ...
 
 def flush_subscribers() -> None:
-    """Wait for queued subscriber callbacks and their transitive publications.
+    """Wait for queued callbacks and registered managed terminal publications.
 
     Call this function outside subscribers, event sanitizers, conditional
     guardrails, and request or execution intercepts. The public Python wrapper
@@ -2111,8 +2176,8 @@ def scope_register_tool_execution_intercept(
         priority: Execution order; lower values run first.
         callable: Middleware callback returning
             ``ToolExecutionInterceptOutcome`` while the owning scope is active.
-            Its ``next`` continuation resolves to the raw downstream result
-            while Relay retains downstream pending marks.
+            Its ``next`` continuation resolves to the canonical downstream
+            ``ToolExecutionResult`` while Relay retains downstream pending marks.
 
     Returns:
         ``None``.
@@ -2385,12 +2450,23 @@ def clear_plugin_configuration() -> None:
     """
     ...
 
-def active_plugin_report() -> Optional[_JsonObject]:
-    """Return the active plugin report.
+def clear_plugin_configuration_async() -> Awaitable[None]:
+    """Clear active plugin configuration without blocking the Python event loop.
 
     Returns:
-        Report JSON object for the last active configuration, or ``None`` if no
-        plugin configuration is active.
+        Awaitable resolving when native teardown completes.
+
+    Exceptional flow:
+        Native cleanup and teardown worker errors propagate through the awaitable.
+    """
+    ...
+
+def active_plugin_report() -> Optional[_JsonObject]:
+    """Return the active plugin report or a failed-teardown diagnostic report.
+
+    Returns:
+        Report JSON object for the active configuration or a failed teardown
+        with runtime diagnostics, or ``None`` if neither exists.
     """
     ...
 

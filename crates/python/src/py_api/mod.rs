@@ -26,6 +26,7 @@ use nemo_relay::api::runtime::{
     TASK_SCOPE_STACK, capture_propagation_context as capture_propagation_context_handle,
     capture_propagation_context_with_root as capture_propagation_context_with_root_handle,
     capture_thread_scope_stack as capture_thread_scope_stack_handle,
+    capture_traceparent as capture_traceparent_handle,
     create_scope_stack as create_scope_stack_handle,
     create_scope_stack_from_propagation as create_scope_stack_from_propagation_handle,
     current_scope_stack as current_scope_stack_handle,
@@ -41,6 +42,7 @@ use nemo_relay::api::tool::ToolAttributes;
 use nemo_relay::codec::response::AnnotatedLlmResponse;
 use nemo_relay::codec::traits::{LlmCodec, LlmResponseCodec};
 use nemo_relay::error::{FlowError, Result as FlowResult};
+use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
@@ -48,10 +50,11 @@ use uuid::Uuid;
 use crate::convert::{json_to_py, opt_py_to_json, opt_py_to_timestamp, py_to_json};
 use crate::py_callable;
 use crate::py_types::{
-    PyAnnotatedLLMResponse, PyAnthropicMessagesCodec, PyLLMAttributes, PyLLMHandle, PyLLMRequest,
-    PyLlmStream, PyOpenAIChatCodec, PyOpenAIResponsesCodec, PyPropagationContext,
-    PyScopeAttributes, PyScopeHandle, PyScopeStack, PyScopeType, PyThreadScopeStackBinding,
-    PyToolAttributes, PyToolHandle,
+    PyAnnotatedLLMResponse, PyAnthropicMessagesCodec, PyGeminiGenerateContentCodec,
+    PyLLMAttributes, PyLLMHandle, PyLLMRequest, PyLlmStream, PyOCIGenAIChatCodec,
+    PyOpenAIChatCodec, PyOpenAIResponsesCodec, PyPropagationContext, PyScopeAttributes,
+    PyScopeHandle, PyScopeStack, PyScopeType, PyThreadScopeStackBinding, PyToolAttributes,
+    PyToolExecutionResult, PyToolHandle,
 };
 
 pub(crate) type RustJsonStream = LlmJsonStream;
@@ -61,12 +64,122 @@ fn to_py_err(e: FlowError) -> PyErr {
     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
 }
 
+#[pyfunction(name = "_shutdown_default_logging")]
+fn py_shutdown_default_logging(py: Python<'_>) -> PyResult<()> {
+    py.detach(nemo_relay::logging::shutdown_default_logging)
+        .map_err(to_py_err)
+}
+
 fn python_event_loop_running(py: Python<'_>) -> PyResult<bool> {
     match py.import("asyncio")?.call_method0("get_running_loop") {
         Ok(_) => Ok(true),
         Err(error) if error.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py) => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+#[pyclass]
+struct SafeFutureCanceller {
+    sender: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[pymethods]
+impl SafeFutureCanceller {
+    fn __call__(&mut self, future: &Bound<'_, PyAny>) -> PyResult<()> {
+        if future.call_method0("cancelled")?.is_truthy()?
+            && let Some(sender) = self.sender.take()
+        {
+            let _ = sender.send(());
+        }
+        Ok(())
+    }
+}
+
+#[pyclass]
+struct SafeFutureCompleter {
+    future: Py<PyAny>,
+    result: Option<PyResult<Py<PyAny>>>,
+}
+
+#[pymethods]
+impl SafeFutureCompleter {
+    fn __call__(&mut self, py: Python<'_>) -> PyResult<()> {
+        let future = self.future.bind(py);
+        if future.call_method0("cancelled")?.is_truthy()? {
+            return Ok(());
+        }
+        match self.result.take().expect("future completion result") {
+            Ok(value) => future.call_method1("set_result", (value.bind(py),))?,
+            Err(error) => future.call_method1("set_exception", (error.into_bound_py_any(py)?,))?,
+        };
+        Ok(())
+    }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "unknown error"
+    }
+}
+
+fn safe_future_into_py<'py, F>(py: Python<'py>, future: F) -> PyResult<Bound<'py, PyAny>>
+where
+    F: Future<Output = PyResult<Py<PyAny>>> + Send + 'static,
+{
+    let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+    let event_loop = locals.event_loop(py).unbind();
+    let python_future = event_loop.bind(py).call_method0("create_future")?.unbind();
+    let (cancel_sender, mut cancel_receiver) = tokio::sync::oneshot::channel();
+    python_future.call_method1(
+        py,
+        "add_done_callback",
+        (SafeFutureCanceller {
+            sender: Some(cancel_sender),
+        },),
+    )?;
+    let completion_future = python_future.clone_ref(py);
+    pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+        let mut task = tokio::spawn(pyo3_async_runtimes::tokio::scope(locals, future));
+        let result = tokio::select! {
+            result = &mut task => Some(
+                match result {
+                    Ok(result) => result,
+                    Err(error) if error.is_panic() => Err(pyo3_async_runtimes::err::RustPanic::new_err(
+                        format!("rust future panicked: {}", panic_message(error.into_panic().as_ref())),
+                    )),
+                    Err(error) => Err(pyo3::exceptions::PyRuntimeError::new_err(error.to_string())),
+                },
+            ),
+            _ = &mut cancel_receiver => {
+                task.abort();
+                let _ = task.await;
+                None
+            },
+        };
+        let Some(result) = result else { return };
+        Python::attach(|py| {
+            let loop_is_closed = event_loop
+                .bind(py)
+                .call_method0("is_closed")
+                .and_then(|closed| closed.is_truthy())
+                .unwrap_or(true);
+            if loop_is_closed {
+                return;
+            }
+            let _ = event_loop.bind(py).call_method1(
+                "call_soon_threadsafe",
+                (SafeFutureCompleter {
+                    future: completion_future,
+                    result: Some(result),
+                },),
+            );
+        });
+    });
+    Ok(python_future.into_bound(py))
 }
 
 fn with_python_publication_context<T>(f: impl FnOnce() -> T) -> T {
@@ -147,6 +260,12 @@ fn py_llm_response_codec(
         if let Ok(builtin) = c.extract::<pyo3::PyRef<'_, PyAnthropicMessagesCodec>>() {
             return Some(builtin.inner_response_codec.clone());
         }
+        if let Ok(builtin) = c.extract::<pyo3::PyRef<'_, PyOCIGenAIChatCodec>>() {
+            return Some(builtin.inner_response_codec.clone());
+        }
+        if let Ok(builtin) = c.extract::<pyo3::PyRef<'_, PyGeminiGenerateContentCodec>>() {
+            return Some(builtin.inner_response_codec.clone());
+        }
         // Fall back to wrapping the Python object as a custom response codec
         Some(Arc::new(py_callable::PyLlmResponseCodecWrapper {
             py_codec: c.clone().unbind(),
@@ -166,6 +285,12 @@ fn py_llm_codec(codec: Option<&Bound<'_, PyAny>>) -> Option<Arc<dyn LlmCodec>> {
             return Some(builtin.inner_codec.clone());
         }
         if let Ok(builtin) = codec.extract::<pyo3::PyRef<'_, PyAnthropicMessagesCodec>>() {
+            return Some(builtin.inner_codec.clone());
+        }
+        if let Ok(builtin) = codec.extract::<pyo3::PyRef<'_, PyOCIGenAIChatCodec>>() {
+            return Some(builtin.inner_codec.clone());
+        }
+        if let Ok(builtin) = codec.extract::<pyo3::PyRef<'_, PyGeminiGenerateContentCodec>>() {
             return Some(builtin.inner_codec.clone());
         }
         Some(Arc::new(py_callable::PyLlmCodecWrapper {
@@ -266,6 +391,12 @@ pub fn capture_propagation_context_with_root(
     capture_propagation_context_with_root_handle(root_uuid)
         .map(|inner| PyPropagationContext { inner })
         .map_err(to_py_err)
+}
+
+/// Capture the current Relay context as a W3C ``traceparent`` value.
+#[pyfunction]
+pub fn capture_traceparent() -> PyResult<String> {
+    capture_traceparent_handle().map_err(to_py_err)
 }
 
 /// Create an isolated scope stack seeded from a received propagation context.
@@ -626,21 +757,21 @@ fn tool_call(
 #[pyfunction]
 #[pyo3(signature = (
     handle: "ToolHandle",
-    result: "object",
+    result: "ToolExecutionResult",
 	    *,
 	    data: "object | None"=None,
 	    metadata: "object | None"=None,
 	    timestamp: "datetime.datetime | None"=None
-) -> "None", text_signature = "(handle: ToolHandle, result: object, *, data: object | None = None, metadata: object | None = None, timestamp: datetime.datetime | None = None) -> None")]
+) -> "None", text_signature = "(handle: ToolHandle, result: ToolExecutionResult, *, data: object | None = None, metadata: object | None = None, timestamp: datetime.datetime | None = None) -> None")]
 fn tool_call_end(
-    _py: Python<'_>,
+    py: Python<'_>,
     handle: &PyToolHandle,
-    result: &Bound<'_, PyAny>,
+    result: PyToolExecutionResult,
     data: Option<&Bound<'_, PyAny>>,
     metadata: Option<&Bound<'_, PyAny>>,
     timestamp: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<()> {
-    let result_json = py_to_json(result)?;
+    let execution_result = result.to_inner(py)?;
     let data = opt_py_to_json(data)?;
     let metadata = opt_py_to_json(metadata)?;
     let timestamp = opt_py_to_timestamp(timestamp)?;
@@ -648,7 +779,7 @@ fn tool_call_end(
         core_tool_api::tool_call_end(
             core_tool_api::ToolCallEndParams::builder()
                 .handle(&handle.inner)
-                .result(result_json)
+                .execution_result(execution_result)
                 .data_opt(data)
                 .metadata_opt(metadata)
                 .timestamp_opt(timestamp)
@@ -670,7 +801,7 @@ fn tool_call_end(
 /// Args:
 ///     name: Tool name.
 ///     args: JSON-serializable tool arguments.
-///     func: An async callable ``(args) -> result`` that performs the tool work.
+///     func: An async callable ``(args) -> ToolExecutionResult`` that performs the tool work.
 ///     handle: Optional parent scope handle.
 ///     attributes: Optional ``ToolAttributes`` bitflags.
 ///     data: Optional JSON-serializable application data.
@@ -716,7 +847,7 @@ fn tool_call_execute<'py>(
     let scope_stack = current_scope_stack_handle();
     let publication_context = py_callable::capture_python_publication_context();
     let publication_buffer = capture_nested_publication_buffer();
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    safe_future_into_py(py, async move {
         with_task_nested_publication_buffer(
             publication_buffer,
             with_task_publication_context(
@@ -735,7 +866,10 @@ fn tool_call_execute<'py>(
                     )
                     .await
                     .map_err(to_py_err)?;
-                    Python::attach(|py| json_to_py(py, &result))
+                    Python::attach(|py| {
+                        Py::new(py, PyToolExecutionResult::from_inner(py, result)?)
+                            .map(Py::into_any)
+                    })
                 }),
             ),
         )
@@ -1978,10 +2112,13 @@ fn scope_deregister_subscriber(scope_uuid: &str, name: &str) -> PyResult<bool> {
 
 /// Register all API functions into the given `PyModule`.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(py_shutdown_default_logging, m)?)?;
+
     // Scope stack creation / binding / query
     m.add_function(wrap_pyfunction!(create_scope_stack, m)?)?;
     m.add_function(wrap_pyfunction!(capture_propagation_context, m)?)?;
     m.add_function(wrap_pyfunction!(capture_propagation_context_with_root, m)?)?;
+    m.add_function(wrap_pyfunction!(capture_traceparent, m)?)?;
     m.add_function(wrap_pyfunction!(create_scope_stack_from_propagation, m)?)?;
     m.add_function(wrap_pyfunction!(set_thread_scope_stack, m)?)?;
     m.add_function(wrap_pyfunction!(capture_thread_scope_stack, m)?)?;

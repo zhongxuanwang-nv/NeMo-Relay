@@ -10,6 +10,7 @@ const {
   ScopeType,
   deregisterSubscriber,
   event,
+  flushSubscribers,
   llmCall,
   llmCallEnd,
   popScope,
@@ -27,13 +28,6 @@ const parseTimestampMicros = (value) => {
   return Date.parse(`${base}${zone}`) * 1000 + Number(fraction.padEnd(6, '0').slice(0, 6));
 };
 
-async function waitForTimestampEvents(events) {
-  const deadline = Date.now() + 2000;
-  while (events.filter((event) => event.name.startsWith('node_ts_')).length < 7 && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
-
 test('manual lifecycle APIs accept optional timestamp arguments', async () => {
   const events = [];
   const timestamps = [
@@ -50,7 +44,7 @@ test('manual lifecycle APIs accept optional timestamp arguments', async () => {
   const scope = pushScope('node_ts_scope', ScopeType.Agent, null, null, null, null, null, timestamps[0]);
   event('node_ts_mark', scope, null, null, timestamps[1]);
   const tool = toolCall('node_ts_tool', { x: 1 }, null, null, null, null, null, timestamps[2]);
-  toolCallEnd(tool, { ok: true }, null, null, timestamps[3]);
+  toolCallEnd(tool, { result: { ok: true } }, null, null, timestamps[3]);
   const llm = llmCall(
     'node_ts_llm',
     { headers: {}, content: { messages: [], model: 'test-model' } },
@@ -63,7 +57,7 @@ test('manual lifecycle APIs accept optional timestamp arguments', async () => {
   );
   llmCallEnd(llm, { ok: true }, null, null, timestamps[5]);
   popScope(scope, null, timestamps[6]);
-  await waitForTimestampEvents(events);
+  await flushSubscribers();
   deregisterSubscriber(subscriberName);
 
   assert.deepEqual(
@@ -113,11 +107,11 @@ test('manual lifecycle APIs reject invalid timestamp microseconds', () => {
       const tool = toolCall('node_bad_ts_tool', { x: 1 });
       try {
         assert.throws(
-          () => toolCallEnd(tool, { ok: true }, null, null, badTimestamp),
+          () => toolCallEnd(tool, { result: { ok: true } }, null, null, badTimestamp),
           /safe integer number of Unix microseconds/,
         );
       } finally {
-        toolCallEnd(tool, { ok: true });
+        toolCallEnd(tool, { result: { ok: true } });
       }
 
       assert.throws(

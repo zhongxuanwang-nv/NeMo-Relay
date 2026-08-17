@@ -3,12 +3,12 @@
 
 //! Asynchronous subscriber delivery for native targets.
 
-use crate::api::event::Event;
+use crate::api::event::{Event, EventSanitizeFields};
 use crate::api::registry::Guardrail;
 use crate::api::runtime::{
     EventSanitizeFn, EventSubscriberFn, NemoRelayContextState, ScopeStackHandle,
 };
-use crate::error::Result;
+use crate::error::{FlowError, Result};
 use std::any::Any;
 use std::cell::RefCell;
 use std::future::Future;
@@ -82,6 +82,37 @@ pub(crate) type EventTransformFn = Box<
     dyn FnOnce(Event) -> Pin<Box<dyn Future<Output = Event> + Send + 'static>> + Send + 'static,
 >;
 
+/// Completion receipt for one queued subscriber delivery.
+///
+/// Unlike [`flush_subscribers`], this receipt waits only for sanitizer and
+/// subscriber processing of the event that created it. Events queued later are
+/// not part of the wait.
+#[doc(hidden)]
+pub struct SubscriberDelivery {
+    completion: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl SubscriberDelivery {
+    fn completed() -> Self {
+        let (completion_tx, completion) = tokio::sync::oneshot::channel();
+        let _ = completion_tx.send(());
+        Self { completion }
+    }
+
+    /// Wait until this event's subscriber delivery is complete.
+    ///
+    /// Do not call this from a subscriber, event-sanitizer, guardrail, or
+    /// intercept callback. The dispatcher signals completion on its own
+    /// thread, so waiting there creates a wait cycle.
+    pub async fn wait(self) -> Result<()> {
+        self.completion.await.map_err(|error| {
+            FlowError::Internal(format!(
+                "subscriber delivery completion channel closed: {error}"
+            ))
+        })
+    }
+}
+
 mod native {
     use std::cell::{Cell, RefCell};
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -108,9 +139,17 @@ mod native {
             scope_stack: ScopeStackHandle,
             publication_context: Option<PublicationContext>,
             lineage: Option<PublicationPermit>,
+            completion: Option<tokio::sync::oneshot::Sender<()>>,
         },
         Flush {
             done: Sender<()>,
+            include_pending: bool,
+        },
+        RegisterPending {
+            lineage: Arc<PublicationLineage>,
+        },
+        CompletePending {
+            permit: PublicationPermit,
         },
         Barrier {
             publications: Receiver<Vec<DispatcherMessage>>,
@@ -121,6 +160,7 @@ mod native {
     #[derive(Default)]
     pub(super) struct PublicationLineage {
         outstanding: AtomicUsize,
+        pending_terminal: bool,
     }
 
     pub(super) struct PublicationPermit(Arc<PublicationLineage>);
@@ -242,6 +282,22 @@ mod native {
         pub(super) sender: Sender<Vec<DispatcherMessage>>,
     }
 
+    pub(crate) struct PendingPublication {
+        sender: Sender<DispatcherMessage>,
+        permit: Option<PublicationPermit>,
+    }
+
+    impl Drop for PendingPublication {
+        fn drop(&mut self) {
+            let Some(permit) = self.permit.take() else {
+                return;
+            };
+            let _ = self
+                .sender
+                .send(DispatcherMessage::CompletePending { permit });
+        }
+    }
+
     fn process_state() -> &'static ProcessState {
         let mut state = PROCESS_STATE.load(Ordering::Acquire);
         if state.is_null() {
@@ -331,7 +387,9 @@ mod native {
                     current
                 }
             }
-            DispatcherMessage::Flush { .. } => current,
+            DispatcherMessage::Flush { .. }
+            | DispatcherMessage::RegisterPending { .. }
+            | DispatcherMessage::CompletePending { .. } => current,
         }
     }
 
@@ -460,6 +518,7 @@ mod native {
             scope_stack,
             publication_context: current_publication_context(),
             lineage: None,
+            completion: None,
         };
         send_dispatch_message(message)
     }
@@ -484,8 +543,42 @@ mod native {
             scope_stack,
             publication_context: current_publication_context(),
             lineage: None,
+            completion: None,
         };
         enqueue_dispatch_message(message)
+    }
+
+    pub(super) fn dispatch_sanitized_event_with_delivery(
+        event: Event,
+        sanitizers: Vec<Guardrail<EventSanitizeFn>>,
+        subscribers: &[EventSubscriberFn],
+        scope_stack: ScopeStackHandle,
+    ) -> Result<SubscriberDelivery> {
+        if subscribers.is_empty() {
+            return Ok(SubscriberDelivery::completed());
+        }
+        let Some(scope_stack) = immutable_scope_stack(&scope_stack) else {
+            return Err(FlowError::Internal(
+                "failed to snapshot scope stack for subscriber delivery".into(),
+            ));
+        };
+        let (completion_tx, completion) = tokio::sync::oneshot::channel();
+        let message = DispatcherMessage::Deliver {
+            event: Box::new(event),
+            transform: None,
+            sanitizers,
+            subscribers: subscribers.to_vec(),
+            scope_stack,
+            publication_context: current_publication_context(),
+            lineage: None,
+            completion: Some(completion_tx),
+        };
+        if !enqueue_dispatch_message(message) {
+            return Err(FlowError::Internal(
+                "failed to queue tracked subscriber delivery".into(),
+            ));
+        }
+        Ok(SubscriberDelivery { completion })
     }
 
     pub(super) fn dispatch_reserved_sanitized_event(
@@ -508,6 +601,7 @@ mod native {
             scope_stack,
             publication_context: current_publication_context(),
             lineage: None,
+            completion: None,
         };
         enqueue_dispatch_message(message)
     }
@@ -530,6 +624,7 @@ mod native {
             scope_stack,
             publication_context: current_publication_context(),
             lineage: None,
+            completion: None,
         };
         enqueue_dispatch_message(message)
     }
@@ -548,7 +643,28 @@ mod native {
         })
     }
 
-    pub(super) fn flush_subscribers() -> Result<()> {
+    /// Track asynchronous work without blocking unrelated dispatcher delivery.
+    ///
+    /// A flush observed after this registration waits until the returned handle
+    /// is dropped. Dropping the handle queues completion behind any terminal
+    /// publications sent by that work.
+    pub(super) fn register_pending_publication() -> Option<PendingPublication> {
+        let sender = dispatcher_sender().ok()?;
+        let lineage = Arc::new(PublicationLineage {
+            outstanding: AtomicUsize::new(0),
+            pending_terminal: true,
+        });
+        let permit = PublicationPermit::new(Arc::clone(&lineage));
+        sender
+            .send(DispatcherMessage::RegisterPending { lineage })
+            .ok()?;
+        Some(PendingPublication {
+            sender,
+            permit: Some(permit),
+        })
+    }
+
+    fn flush_subscribers_inner(include_pending: bool, started: Option<Sender<()>>) -> Result<()> {
         if in_dispatcher_callback() {
             return Ok(());
         }
@@ -567,14 +683,32 @@ mod native {
         };
         let (done_tx, done_rx) = mpsc::channel();
         sender
-            .send(DispatcherMessage::Flush { done: done_tx })
+            .send(DispatcherMessage::Flush {
+                done: done_tx,
+                include_pending,
+            })
             .map_err(|error| {
                 FlowError::Internal(format!("failed to queue subscriber flush: {error}"))
             })?;
+        if let Some(started) = started {
+            let _ = started.send(());
+        }
         done_rx
             .recv()
             .map_err(|error| FlowError::Internal(format!("subscriber flush failed: {error}")))?;
         Ok(())
+    }
+
+    pub(super) fn flush_subscribers() -> Result<()> {
+        flush_subscribers_inner(true, None)
+    }
+
+    pub(super) fn flush_subscribers_with_started_signal(started: Sender<()>) -> Result<()> {
+        flush_subscribers_inner(true, Some(started))
+    }
+
+    pub(super) fn flush_queued_subscribers() -> Result<()> {
+        flush_subscribers_inner(false, None)
     }
 
     pub(super) fn in_dispatcher_callback() -> bool {
@@ -740,11 +874,12 @@ mod native {
             }
         }
 
-        fn defer_or_complete_flush(&mut self, done: Sender<()>) {
+        fn defer_or_complete_flush(&mut self, done: Sender<()>, include_pending: bool) {
             let lineages = self
                 .active_lineages
                 .iter()
                 .filter_map(Weak::upgrade)
+                .filter(|lineage| include_pending || !lineage.pending_terminal)
                 .filter(|lineage| lineage.outstanding.load(Ordering::Acquire) > 0)
                 .collect::<Vec<_>>();
             if lineages.is_empty() {
@@ -790,8 +925,20 @@ mod native {
         inherited: Option<&Arc<PublicationLineage>>,
     ) {
         let lineage = match message {
-            DispatcherMessage::Flush { done } => {
-                state.defer_or_complete_flush(done);
+            DispatcherMessage::Flush {
+                done,
+                include_pending,
+            } => {
+                state.defer_or_complete_flush(done, include_pending);
+                return;
+            }
+            DispatcherMessage::RegisterPending { lineage } => {
+                state.register(&lineage);
+                return;
+            }
+            DispatcherMessage::CompletePending { permit } => {
+                state.register(&permit.lineage());
+                drop(permit);
                 return;
             }
             _ => attach_publication_lineage(&mut message, inherited),
@@ -806,6 +953,7 @@ mod native {
                 scope_stack,
                 publication_context,
                 lineage: permit,
+                completion,
             } => {
                 let nested_publications = with_publication_lineage(Arc::clone(&lineage), || {
                     deliver_event(
@@ -821,6 +969,9 @@ mod native {
                 for publication in nested_publications {
                     handle_message(publication, state, Some(&lineage));
                 }
+                if let Some(completion) = completion {
+                    let _ = completion.send(());
+                }
             }
             DispatcherMessage::Barrier {
                 publications,
@@ -833,7 +984,9 @@ mod native {
                 }
                 drop(permit);
             }
-            DispatcherMessage::Flush { .. } => unreachable!(),
+            DispatcherMessage::Flush { .. }
+            | DispatcherMessage::RegisterPending { .. }
+            | DispatcherMessage::CompletePending { .. } => unreachable!(),
         }
         state.complete_ready_flushes();
     }
@@ -887,8 +1040,8 @@ mod native {
 
     /// Apply a transform and sanitizers on the dispatcher thread. A transform
     /// failure drops the event because it may be responsible for inserting the
-    /// sanitized payload. A sanitizer failure retains the transformed snapshot
-    /// and continues publication (fail open).
+    /// sanitized payload. A sanitizer failure clears mutable observability
+    /// fields before publication.
     pub(super) fn sanitize_event_snapshot(
         event: Event,
         transform: Option<EventTransformFn>,
@@ -957,10 +1110,12 @@ mod native {
                 }
                 log::error!(
                     target: "nemo_relay.runtime",
-                    event = "event_sanitizer_fail_open";
-                    "Publishing the transformed event snapshot because event sanitizers could not run"
+                    event = "event_sanitizer_runtime_failed";
+                    "Event sanitizers could not run; clearing observability fields before publication"
                 );
-                return (Some(transformed), nested_publications);
+                let mut cleared = transformed;
+                cleared.apply_sanitize_fields(EventSanitizeFields::default());
+                return (Some(cleared), nested_publications);
             }
         };
         let fallback = transformed.clone();
@@ -977,9 +1132,11 @@ mod native {
                 log::error!(
                     target: "nemo_relay.runtime",
                     event = "event_sanitizer_panicked";
-                    "Event sanitizer panicked; preserving the last valid event snapshot"
+                    "Event sanitizer panicked; clearing observability fields"
                 );
-                Some(fallback)
+                let mut cleared = fallback;
+                cleared.apply_sanitize_fields(EventSanitizeFields::default());
+                Some(cleared)
             }
         };
         (event, nested_publications)
@@ -1098,6 +1255,15 @@ pub(crate) fn dispatch_sanitized_event(
     native::dispatch_sanitized_event(event, sanitizers, subscribers, scope_stack)
 }
 
+pub(crate) fn dispatch_sanitized_event_with_delivery(
+    event: Event,
+    sanitizers: Vec<Guardrail<EventSanitizeFn>>,
+    subscribers: &[EventSubscriberFn],
+    scope_stack: ScopeStackHandle,
+) -> Result<SubscriberDelivery> {
+    native::dispatch_sanitized_event_with_delivery(event, sanitizers, subscribers, scope_stack)
+}
+
 /// Publish a stream-finalization event at its reserved FIFO position.
 pub(crate) fn dispatch_reserved_sanitized_event(
     event: Event,
@@ -1128,6 +1294,18 @@ pub(crate) fn register_async_publication() -> Option<native::AsyncPublication> {
     native::register_async_publication()
 }
 
+pub(crate) use native::PendingPublication;
+
+/// Register pending asynchronous work that must finish before a later
+/// subscriber flush can complete.
+///
+/// Unlike an async publication barrier, this does not block unrelated
+/// dispatcher delivery. Dropping the returned handle releases pending flushes
+/// after previously queued terminal publications have been delivered.
+pub(crate) fn register_pending_publication() -> Option<native::PendingPublication> {
+    native::register_pending_publication()
+}
+
 /// Run asynchronous middleware as part of an already-registered publication,
 /// buffering the finalization publications explicitly assigned to its reserved
 /// FIFO position.
@@ -1150,10 +1328,26 @@ where
     native::spawn_background_publication(future)
 }
 
-/// Wait for all queued subscriber callbacks submitted before this call,
-/// including publications emitted transitively by those callbacks.
+/// Wait for all queued subscriber callbacks and managed terminal publications
+/// registered before this call, including publications emitted transitively by
+/// those callbacks.
 pub fn flush_subscribers() -> Result<()> {
     native::flush_subscribers()
+}
+
+/// Wait for subscriber completion and signal once the flush request has been
+/// queued, immediately before waiting for the dispatcher to acknowledge it.
+#[doc(hidden)]
+pub fn flush_subscribers_with_started_signal(started: std::sync::mpsc::Sender<()>) -> Result<()> {
+    native::flush_subscribers_with_started_signal(started)
+}
+
+/// Wait only for subscriber publications already queued on the dispatcher.
+///
+/// Plugin teardown uses this legacy barrier so it can detach registries while
+/// managed callbacks from an earlier snapshot remain in flight.
+pub(crate) fn flush_queued_subscribers() -> Result<()> {
+    native::flush_queued_subscribers()
 }
 
 /// Acquire process-local dispatcher resources before a Unix `fork`.

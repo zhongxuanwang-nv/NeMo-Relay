@@ -4,7 +4,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { waitForSubscriberCallbacks } from './test_support.mjs';
 
 const require = createRequire(import.meta.url);
 const lib = require('../index.js');
@@ -62,6 +61,10 @@ function sparseArray() {
   return values;
 }
 
+function toolResult(result, annotation) {
+  return annotation == null ? { result } : { result, annotation };
+}
+
 // ===========================================================================
 // Tool lifecycle
 // ===========================================================================
@@ -95,7 +98,7 @@ describe('Tool lifecycle', () => {
   it('tool call with attributes', () => {
     const handle = toolCall('attr_tool', {}, null, TOOL_ATTR_LOCAL, null, null);
     assert.equal(handle.attributes, TOOL_ATTR_LOCAL);
-    toolCallEnd(handle, {}, null, null);
+    toolCallEnd(handle, toolResult({}), null, null);
   });
 
   it('tool call with data/metadata', () => {
@@ -113,7 +116,7 @@ describe('Tool lifecycle', () => {
     );
     toolCallEnd(
       handle,
-      {},
+      toolResult({}),
       {
         done: true,
       },
@@ -125,7 +128,7 @@ describe('Tool lifecycle', () => {
     const scope = pushScope('tool_parent', ScopeType.Agent, null, null);
     const handle = toolCall('parented_tool', {}, scope, null, null, null);
     assert.equal(handle.parentUuid, scope.uuid);
-    toolCallEnd(handle, {}, null, null);
+    toolCallEnd(handle, toolResult({}), null, null);
     popScope(scope);
   });
 
@@ -134,11 +137,8 @@ describe('Tool lifecycle', () => {
     registerSubscriber('node_tool_evt_sub', (e) => events.push(e));
     try {
       const handle = toolCall('evt_tool', {}, null, null, null, null);
-      toolCallEnd(handle, {}, null, null);
-      const deadline = Date.now() + 2000;
-      while (events.length < 2 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 10));
-      }
+      toolCallEnd(handle, toolResult({}), null, null);
+      await flushSubscribers();
       assert.ok(events.length >= 2, 'Expected at least 2 events');
     } finally {
       deregisterSubscriber('node_tool_evt_sub');
@@ -169,9 +169,7 @@ describe('Tool lifecycle', () => {
       assert.equal(handle.attributes, TOOL_ATTR_LOCAL);
       toolCallEnd(
         handle,
-        {
-          result: 42,
-        },
+        toolResult(42, { provider: 'manual' }),
         {
           end: true,
         },
@@ -180,10 +178,7 @@ describe('Tool lifecycle', () => {
         },
       );
 
-      const deadline = Date.now() + 2000;
-      while (events.filter((e) => e.name === 'field_tool').length < 2 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 10));
-      }
+      await flushSubscribers();
 
       const start = events.find(
         (e) => e.name === 'field_tool' && e.kind === 'scope' && e.category === 'tool' && e.scope_category === 'start',
@@ -195,9 +190,9 @@ describe('Tool lifecycle', () => {
       assert.deepEqual(start.data, {
         x: 1,
       });
-      assert.deepEqual(end.data, {
-        result: 42,
-      });
+      assert.equal(end.data, 42);
+      assert.equal(end.category_profile.tool_call_id, 'tool-call-123');
+      assert.deepEqual(end.category_profile.tool_result_annotation, { provider: 'manual' });
     } finally {
       deregisterSubscriber('node_tool_field_sub');
       popScope(scope);
@@ -229,19 +224,15 @@ describe('Tool execute', () => {
     });
   });
 
-  it('treats implicit undefined tool results as null', async () => {
-    const result = await toolCallExecute(
-      'exec_tool_undefined',
-      {
-        x: 10,
-      },
-      () => undefined,
-      null,
-      null,
-      null,
-      null,
-    );
-    assert.equal(result, null);
+  it('rejects legacy raw tool results from sync and async producers', async () => {
+    const cases = [
+      () => toolCallExecute('exec_tool_undefined', { x: 10 }, () => undefined),
+      () => toolCallExecute('exec_tool_legacy_raw', {}, () => ({ legacy: true })),
+      () => toolCallExecuteAsync('exec_async_tool_legacy_raw', {}, async () => ({ legacy: true })),
+    ];
+    for (const execute of cases) {
+      await assert.rejects(execute, /must return ToolExecutionResult/i);
+    }
   });
 
   it('sync execute rejects thrown callbacks without terminating Node', async () => {
@@ -253,32 +244,30 @@ describe('Tool execute', () => {
       /sync tool callback failed/,
     );
 
-    const result = await toolCallExecute('exec_tool_after_throw', {}, () => ({
-      ok: true,
-    }));
-    assert.deepEqual(result, {
-      ok: true,
-    });
+    const result = await toolCallExecute('exec_tool_after_throw', {}, () => toolResult({ ok: true }));
+    assert.deepEqual(result, toolResult({ ok: true }));
   });
 
   it('sync and async execute reject invalid JSON results without terminating Node', async () => {
     const cases = [
-      ['sync_bigint', () => toolCallExecute('exec_tool_bigint', {}, () => 1n)],
-      ['async_bigint', () => toolCallExecuteAsync('exec_async_tool_bigint', {}, async () => ({ value: 1n }))],
-      ['sync_date', () => toolCallExecute('exec_tool_date', {}, () => new Date())],
-      ['async_map', () => toolCallExecuteAsync('exec_async_tool_map', {}, async () => new Map([['value', 1]]))],
-      ['sync_sparse_array', () => toolCallExecute('exec_tool_sparse_array', {}, sparseArray)],
-      ['async_sparse_array', () => toolCallExecuteAsync('exec_async_tool_sparse_array', {}, async () => sparseArray())],
+      ['sync_bigint', () => toolCallExecute('exec_tool_bigint', {}, () => toolResult(1n))],
+      ['async_bigint', () => toolCallExecuteAsync('exec_async_tool_bigint', {}, async () => toolResult({ value: 1n }))],
+      ['sync_date', () => toolCallExecute('exec_tool_date', {}, () => toolResult(new Date()))],
+      [
+        'async_map',
+        () => toolCallExecuteAsync('exec_async_tool_map', {}, async () => toolResult(new Map([['value', 1]]))),
+      ],
+      ['sync_sparse_array', () => toolCallExecute('exec_tool_sparse_array', {}, () => toolResult(sparseArray()))],
+      [
+        'async_sparse_array',
+        () => toolCallExecuteAsync('exec_async_tool_sparse_array', {}, async () => toolResult(sparseArray())),
+      ],
     ];
 
     for (const [kind, execute] of cases) {
       await assert.rejects(execute, /bigint|undefined|json/i);
-      const result = await toolCallExecute(`exec_tool_after_${kind}`, {}, () => ({
-        ok: true,
-      }));
-      assert.deepEqual(result, {
-        ok: true,
-      });
+      const result = await toolCallExecute(`exec_tool_after_${kind}`, {}, () => toolResult({ ok: true }));
+      assert.deepEqual(result, toolResult({ ok: true }));
     }
   });
 
@@ -290,17 +279,15 @@ describe('Tool execute', () => {
     };
 
     const cases = [
-      ['sync', () => toolCallExecute('exec_tool_circular', {}, circularResult)],
-      ['async', () => toolCallExecuteAsync('exec_async_tool_circular', {}, async () => circularResult())],
+      ['sync', () => toolCallExecute('exec_tool_circular', {}, () => toolResult(circularResult()))],
+      ['async', () => toolCallExecuteAsync('exec_async_tool_circular', {}, async () => toolResult(circularResult()))],
     ];
 
     for (const [kind, execute] of cases) {
       await assert.rejects(execute, /circular|json/i);
 
-      const result = await toolCallExecute(`exec_tool_after_circular_${kind}`, {}, () => ({
-        ok: true,
-      }));
-      assert.deepEqual(result, { ok: true });
+      const result = await toolCallExecute(`exec_tool_after_circular_${kind}`, {}, () => toolResult({ ok: true }));
+      assert.deepEqual(result, toolResult({ ok: true }));
     }
   });
 
@@ -315,15 +302,13 @@ describe('Tool execute', () => {
       };
     };
     const cases = [
-      () => toolCallExecute('exec_tool_stateful_getter', {}, statefulResult),
-      () => toolCallExecuteAsync('exec_async_tool_stateful_getter', {}, async () => statefulResult()),
+      () => toolCallExecute('exec_tool_stateful_getter', {}, () => toolResult(statefulResult())),
+      () => toolCallExecuteAsync('exec_async_tool_stateful_getter', {}, async () => toolResult(statefulResult())),
     ];
 
     for (const execute of cases) {
       const result = await execute();
-      assert.deepEqual(result, {
-        value: 1,
-      });
+      assert.deepEqual(result, toolResult({ value: 1 }));
     }
   });
 
@@ -336,12 +321,12 @@ describe('Tool execute', () => {
       return result;
     };
     const cases = [
-      () => toolCallExecute('exec_tool_iterator', {}, statefulArray),
-      () => toolCallExecuteAsync('exec_async_tool_iterator', {}, async () => statefulArray()),
+      () => toolCallExecute('exec_tool_iterator', {}, () => toolResult(statefulArray())),
+      () => toolCallExecuteAsync('exec_async_tool_iterator', {}, async () => toolResult(statefulArray())),
     ];
 
     for (const execute of cases) {
-      assert.deepEqual(await execute(), [1]);
+      assert.deepEqual(await execute(), toolResult([1]));
     }
   });
 
@@ -349,17 +334,13 @@ describe('Tool execute', () => {
     const result = await toolCallExecute(
       'exec_attr_tool',
       {},
-      () => ({
-        ok: true,
-      }),
+      () => toolResult({ ok: true }),
       null,
       TOOL_ATTR_LOCAL,
       null,
       null,
     );
-    assert.deepEqual(result, {
-      ok: true,
-    });
+    assert.deepEqual(result, toolResult({ ok: true }));
   });
 
   it('execute records OTEL status metadata on end events', async () => {
@@ -387,11 +368,11 @@ describe('Tool execute', () => {
 
       await assert.rejects(
         () =>
-          toolCallExecuteAsync(
+          toolCallExecute(
             'exec_status_error_tool',
             {},
-            async () => {
-              throw new Error('tool status failure');
+            () => {
+              throw new TypeError('tool status failure');
             },
             null,
             null,
@@ -403,23 +384,7 @@ describe('Tool execute', () => {
         /tool status failure/,
       );
 
-      await waitForSubscriberCallbacks(
-        () =>
-          events.some(
-            (e) =>
-              e.name === 'exec_status_ok_tool' &&
-              e.kind === 'scope' &&
-              e.category === 'tool' &&
-              e.scope_category === 'end',
-          ) &&
-          events.some(
-            (e) =>
-              e.name === 'exec_status_error_tool' &&
-              e.kind === 'scope' &&
-              e.category === 'tool' &&
-              e.scope_category === 'end',
-          ),
-      );
+      await flushSubscribers();
       const okEnd = events.find(
         (e) =>
           e.name === 'exec_status_ok_tool' && e.kind === 'scope' && e.category === 'tool' && e.scope_category === 'end',
@@ -438,6 +403,8 @@ describe('Tool execute', () => {
       assert.equal(errorEnd.metadata.caller, 'node-tool-error');
       assert.equal(errorEnd.metadata['otel.status_code'], 'ERROR');
       assert.match(errorEnd.metadata['otel.status_description'], /tool status failure/);
+      assert.equal(errorEnd.metadata['error.type'], 'internal_error');
+      assert.equal(errorEnd.metadata['exception.type'], 'TypeError');
     } finally {
       deregisterSubscriber('node_tool_status_metadata_sub');
     }
@@ -511,28 +478,14 @@ describe('Tool guardrails', () => {
         {
           x: 1,
         },
-        (args) => args,
+        (args) => toolResult(args),
         null,
         null,
         null,
         null,
       );
-      assert.deepEqual(result, {
-        x: 1,
-      });
-      const deadline = Date.now() + 2000;
-      while (
-        !events.some(
-          (e) =>
-            e.name === 'san_req_evt_tool' &&
-            e.kind === 'scope' &&
-            e.category === 'tool' &&
-            e.scope_category === 'start',
-        ) &&
-        Date.now() < deadline
-      ) {
-        await new Promise((r) => setTimeout(r, 10));
-      }
+      assert.deepEqual(result, toolResult({ x: 1 }));
+      await flushSubscribers();
       const start = events.find(
         (e) =>
           e.name === 'san_req_evt_tool' && e.kind === 'scope' && e.category === 'tool' && e.scope_category === 'start',
@@ -568,27 +521,14 @@ describe('Tool guardrails', () => {
         {
           x: 1,
         },
-        () => ({
-          ok: true,
-        }),
+        () => toolResult({ ok: true }),
         null,
         null,
         null,
         null,
       );
-      assert.deepEqual(result, {
-        ok: true,
-      });
-      const deadline = Date.now() + 2000;
-      while (
-        !events.some(
-          (e) =>
-            e.name === 'san_resp_evt_tool' && e.kind === 'scope' && e.category === 'tool' && e.scope_category === 'end',
-        ) &&
-        Date.now() < deadline
-      ) {
-        await new Promise((r) => setTimeout(r, 10));
-      }
+      assert.deepEqual(result, toolResult({ ok: true }));
+      await flushSubscribers();
       const end = events.find(
         (e) =>
           e.name === 'san_resp_evt_tool' && e.kind === 'scope' && e.category === 'tool' && e.scope_category === 'end',
@@ -614,8 +554,16 @@ describe('Tool guardrails', () => {
       return null;
     });
     try {
-      const result = await toolCallExecute('tool_cond_promise', { ok: true }, (args) => args, null, null, null, null);
-      assert.deepEqual(result, { ok: true });
+      const result = await toolCallExecute(
+        'tool_cond_promise',
+        { ok: true },
+        (args) => toolResult(args),
+        null,
+        null,
+        null,
+        null,
+      );
+      assert.deepEqual(result, toolResult({ ok: true }));
     } finally {
       deregisterToolConditionalExecutionGuardrail('node_tool_cond_promise');
     }
@@ -636,7 +584,7 @@ describe('Tool guardrails', () => {
     try {
       const execution = lib.withScopeStack(invocationStack, () => {
         invocationScope = lib.pushScope('middleware-invocation', lib.ScopeType.Agent);
-        return lib.toolCallExecute('tool_cond_scope_context', {}, (args) => args);
+        return lib.toolCallExecute('tool_cond_scope_context', {}, (args) => toolResult(args));
       });
       lib.setThreadScopeStack(unrelatedStack);
       await execution;
@@ -670,15 +618,13 @@ describe('Tool guardrails', () => {
         {
           ok: true,
         },
-        (args) => args,
+        (args) => toolResult(args),
         null,
         null,
         null,
         null,
       );
-      assert.deepEqual(result, {
-        ok: true,
-      });
+      assert.deepEqual(result, toolResult({ ok: true }));
     } finally {
       deregisterToolConditionalExecutionGuardrail('node_tool_cond_undefined');
     }
@@ -712,19 +658,19 @@ describe('Tool guardrails', () => {
       const result = await toolCallExecute(
         'tool_after_guardrail_throw',
         {},
-        () => ({ ok: true }),
+        () => toolResult({ ok: true }),
         null,
         null,
         null,
         null,
       );
-      assert.deepEqual(result, { ok: true });
+      assert.deepEqual(result, toolResult({ ok: true }));
     } finally {
       deregisterToolConditionalExecutionGuardrail('node_tool_cond_throw');
     }
   });
 
-  it('sanitize guardrail failures preserve the observable payload', async () => {
+  it('sanitize guardrail failures omit the observable payload', async () => {
     clearLastCallbackError();
     const events = [];
     registerSubscriber('node_tool_san_throw_sub', (event) => events.push(event));
@@ -732,8 +678,16 @@ describe('Tool guardrails', () => {
       throw new Error('sanitize boom');
     });
     try {
-      await toolCallExecute('tool_sanitize_throw', { original: true }, (args) => args, null, null, null, null);
-      await waitForSubscriberCallbacks(() => events.some((event) => event.name === 'tool_sanitize_throw'));
+      await toolCallExecute(
+        'tool_sanitize_throw',
+        { original: true },
+        (args) => toolResult(args),
+        null,
+        null,
+        null,
+        null,
+      );
+      await flushSubscribers();
       const start = events.find(
         (event) =>
           event.name === 'tool_sanitize_throw' &&
@@ -741,7 +695,7 @@ describe('Tool guardrails', () => {
           event.category === 'tool' &&
           event.scope_category === 'start',
       );
-      assert.deepEqual(start.data, { original: true });
+      assert.equal(start.data, null);
       assert.match(getLastCallbackError() ?? '', /sanitize boom/i);
     } finally {
       deregisterToolSanitizeRequestGuardrail('node_tool_san_throw');
@@ -767,12 +721,8 @@ describe('Tool guardrails', () => {
     });
     try {
       const handle = toolCall('node_manual_tool_flush', { original: true });
-      toolCallEnd(handle, { ok: true });
-      await waitForSubscriberCallbacks(
-        () =>
-          events.some((event) => event.name === 'node_manual_tool_flush' && event.scope_category === 'start') &&
-          events.some((event) => event.name === 'node_manual_tool_flush' && event.scope_category === 'end'),
-      );
+      toolCallEnd(handle, toolResult({ ok: true }));
+      await flushSubscribers();
     } finally {
       deregisterToolSanitizeRequestGuardrail('node_manual_tool_flush_request');
       deregisterToolSanitizeResponseGuardrail('node_manual_tool_flush_response');
@@ -837,7 +787,13 @@ describe('Tool intercepts', () => {
   });
 
   it('execution intercept register/deregister', () => {
-    registerToolExecutionIntercept('node_tool_exec_int', 10, async (args, next) => ({ result: await next(args) }));
+    registerToolExecutionIntercept('node_tool_exec_int', 10, async (args, next) => {
+      const downstream = await next(args);
+      return {
+        result: downstream.result,
+        ...(downstream.annotation == null ? {} : { annotation: downstream.annotation }),
+      };
+    });
     deregisterToolExecutionIntercept('node_tool_exec_int');
   });
 
@@ -862,13 +818,13 @@ describe('Tool intercepts', () => {
       {
         original: true,
       },
-      (args) => args,
+      (args) => toolResult(args),
       null,
       null,
       null,
       null,
     );
-    assert.equal(result.added, 'yes');
+    assert.equal(result.result.added, 'yes');
     deregisterToolRequestIntercept('node_tool_req_mod');
   });
 
@@ -881,13 +837,13 @@ describe('Tool intercepts', () => {
       const result = await toolCallExecute(
         'tool_req_promise',
         { original: true },
-        (args) => args,
+        (args) => toolResult(args),
         null,
         null,
         null,
         null,
       );
-      assert.deepEqual(result, { original: true, promised: true });
+      assert.deepEqual(result, toolResult({ original: true, promised: true }));
     } finally {
       deregisterToolRequestIntercept('node_tool_req_promise');
     }
@@ -920,13 +876,13 @@ describe('Tool intercepts', () => {
       const result = await toolCallExecute(
         'tool_after_request_intercept_throw',
         {},
-        () => ({ ok: true }),
+        () => toolResult({ ok: true }),
         null,
         null,
         null,
         null,
       );
-      assert.deepEqual(result, { ok: true });
+      assert.deepEqual(result, toolResult({ ok: true }));
     } finally {
       deregisterToolRequestIntercept('node_tool_req_throw');
     }
@@ -940,13 +896,13 @@ describe('Tool intercepts', () => {
         {
           original: true,
         },
-        (args) => args,
+        (args) => toolResult(args),
         null,
         null,
         null,
         null,
       );
-      assert.equal(result, null);
+      assert.deepEqual(result, toolResult(null));
     } finally {
       deregisterToolRequestIntercept('node_tool_req_bad');
     }
@@ -956,15 +912,16 @@ describe('Tool intercepts', () => {
     const events = [];
     registerSubscriber('node_tool_exec_mark_sub', (event) => events.push(event));
     registerToolExecutionIntercept('node_tool_exec_repl', 10, async (args, next) => {
-      const result = await next({
+      const downstream = await next({
         ...args,
         intercepted: true,
       });
       return {
         result: {
-          ...result,
+          ...downstream.result,
           wrapped: true,
         },
+        annotation: downstream.annotation,
         pendingMarks: [{ name: 'node.tool.execution' }],
       };
     });
@@ -972,22 +929,22 @@ describe('Tool intercepts', () => {
       const result = await toolCallExecute(
         'replaced_tool',
         {},
-        (args) => ({
-          original: !args.intercepted,
-        }),
+        (args) =>
+          toolResult(
+            {
+              original: !args.intercepted,
+            },
+            { source: 'provider' },
+          ),
         null,
         null,
         null,
         null,
       );
-      assert.equal(result.original, false);
-      assert.equal(result.wrapped, true);
-      await waitForSubscriberCallbacks(
-        () =>
-          events.some(
-            (event) => event.name === 'replaced_tool' && event.kind === 'scope' && event.scope_category === 'end',
-          ) && events.some((event) => event.name === 'node.tool.execution'),
-      );
+      assert.equal(result.result.original, false);
+      assert.equal(result.result.wrapped, true);
+      assert.deepEqual(result.annotation, { source: 'provider' });
+      await flushSubscribers();
       const start = events.find(
         (event) => event.name === 'replaced_tool' && event.kind === 'scope' && event.scope_category === 'start',
       );
@@ -998,6 +955,7 @@ describe('Tool intercepts', () => {
       assert.ok(start, 'expected tool start event');
       assert.ok(end, 'expected tool end event');
       assert.ok(mark, 'expected tool execution pending mark');
+      assert.deepEqual(end.category_profile.tool_result_annotation, { source: 'provider' });
       assert.equal(mark.parent_uuid, start.uuid);
       assert.ok(events.indexOf(end) < events.indexOf(mark), 'expected tool end before pending mark');
       assert.ok(mark.timestamp > end.timestamp, 'expected pending mark timestamp after tool end');
@@ -1005,6 +963,120 @@ describe('Tool intercepts', () => {
       deregisterToolExecutionIntercept('node_tool_exec_repl');
       deregisterSubscriber('node_tool_exec_mark_sub');
     }
+  });
+
+  it('execution intercept can remove a downstream annotation', async () => {
+    const events = [];
+    registerSubscriber('node_tool_exec_annotation_removal_sub', (event) => events.push(event));
+    registerToolExecutionIntercept('node_tool_exec_annotation_removal', 10, async (args, next) => {
+      const downstream = await next(args);
+      return { result: downstream.result };
+    });
+    try {
+      const result = await toolCallExecute('annotation_removal_tool', {}, () =>
+        toolResult({ ok: true }, { source: 'provider' }),
+      );
+      assert.deepEqual(result, toolResult({ ok: true }));
+      assert.equal(Object.hasOwn(result, 'annotation'), false);
+
+      await flushSubscribers();
+      const end = events.find(
+        (event) => event.name === 'annotation_removal_tool' && event.kind === 'scope' && event.scope_category === 'end',
+      );
+      assert.ok(end, 'expected tool end event');
+      assert.equal(Object.hasOwn(end.category_profile, 'tool_result_annotation'), false);
+    } finally {
+      deregisterToolExecutionIntercept('node_tool_exec_annotation_removal');
+      deregisterSubscriber('node_tool_exec_annotation_removal_sub');
+    }
+  });
+
+  it('normalizes a JSON-null annotation to absence', async () => {
+    const events = [];
+    registerSubscriber('node_tool_exec_null_annotation_sub', (event) => events.push(event));
+    try {
+      const result = await toolCallExecute('null_annotation_tool', {}, () => ({
+        result: { ok: true },
+        annotation: null,
+      }));
+      assert.deepEqual(result, toolResult({ ok: true }));
+      assert.equal(Object.hasOwn(result, 'annotation'), false);
+
+      await flushSubscribers();
+      const end = events.find(
+        (event) => event.name === 'null_annotation_tool' && event.kind === 'scope' && event.scope_category === 'end',
+      );
+      assert.ok(end, 'expected tool end event');
+      assert.equal(Object.hasOwn(end.category_profile, 'tool_result_annotation'), false);
+    } finally {
+      deregisterSubscriber('node_tool_exec_null_annotation_sub');
+    }
+  });
+
+  it('execution callbacks preserve the managed propagation parent across await', async () => {
+    const events = [];
+    const observed = [];
+    registerSubscriber('node_tool_exec_propagation_parent', (event) => events.push(event));
+    registerToolExecutionIntercept('node_tool_exec_propagation_parent', 10, async (args, next) => {
+      observed.push(['intercept-before', lib.capturePropagationContext().parentUuid]);
+      await new Promise((resolve) => setImmediate(resolve));
+      observed.push(['intercept-after', lib.capturePropagationContext().parentUuid]);
+      const downstream = await next(args);
+      return {
+        result: downstream.result,
+        ...(downstream.annotation == null ? {} : { annotation: downstream.annotation }),
+      };
+    });
+    try {
+      const result = await toolCallExecuteAsync('propagation_parent_tool', {}, async () => {
+        observed.push(['provider-before', lib.capturePropagationContext().parentUuid]);
+        await new Promise((resolve) => setImmediate(resolve));
+        observed.push(['provider-after', lib.capturePropagationContext().parentUuid]);
+        return toolResult({ ok: true });
+      });
+      assert.deepEqual(result, toolResult({ ok: true }));
+      await flushSubscribers();
+      const start = events.find(
+        (event) =>
+          event.name === 'propagation_parent_tool' && event.kind === 'scope' && event.scope_category === 'start',
+      );
+      assert.ok(start, 'expected managed tool start event');
+      assert.deepEqual(observed, [
+        ['intercept-before', start.uuid],
+        ['intercept-after', start.uuid],
+        ['provider-before', start.uuid],
+        ['provider-after', start.uuid],
+      ]);
+    } finally {
+      deregisterToolExecutionIntercept('node_tool_exec_propagation_parent');
+      deregisterSubscriber('node_tool_exec_propagation_parent');
+    }
+  });
+
+  it('execution settlement expires scope replacements inherited by detached work', async () => {
+    const baseline = {
+      active: lib.scopeStackActive(),
+      parentUuid: lib.capturePropagationContext().parentUuid,
+    };
+    const replacementStack = lib.createScopeStack();
+    let releaseLateContext;
+    const lateGate = new Promise((resolve) => {
+      releaseLateContext = resolve;
+    });
+    let lateContext;
+
+    await toolCallExecuteAsync('scope_replacement_expiry_tool', {}, async () => {
+      lib.setThreadScopeStack(replacementStack);
+      lateContext = lateGate.then(() => ({
+        active: lib.scopeStackActive(),
+        parentUuid: lib.capturePropagationContext().parentUuid,
+      }));
+      await new Promise((resolve) => setImmediate(resolve));
+      return toolResult({ ok: true });
+    });
+
+    releaseLateContext();
+    assert.deepEqual(await lateContext, baseline);
   });
 
   it('execution intercept rejects a detached next call after settlement', async () => {
@@ -1021,9 +1093,9 @@ describe('Tool intercepts', () => {
     try {
       const result = await toolCallExecute('late_next_tool', { value: 1 }, (args) => {
         providerCalls += 1;
-        return args;
+        return toolResult(args);
       });
-      assert.deepEqual(result, { source: 'intercept' });
+      assert.deepEqual(result, toolResult({ source: 'intercept' }));
       releaseLateNext();
       await assert.rejects(lateNext, /execution continuation is no longer active/i);
       assert.equal(providerCalls, 0);
@@ -1051,7 +1123,7 @@ describe('Tool intercepts', () => {
     let providerSideEffects = 0;
     registerToolExecutionIntercept('node_tool_exec_abort_started_provider', 10, async (args, next) => {
       downstream = next(args);
-      void downstream.catch(() => {});
+      downstream.catch(() => undefined);
       await started;
       return { result: { source: 'intercept' } };
     });
@@ -1072,9 +1144,9 @@ describe('Tool intercepts', () => {
           }),
         ]);
         providerSideEffects += 1;
-        return { source: 'provider' };
+        return toolResult({ source: 'provider' });
       });
-      assert.deepEqual(result, { source: 'intercept' });
+      assert.deepEqual(result, toolResult({ source: 'intercept' }));
       await assert.rejects(downstream, /execution continuation is no longer active/i);
       await assertCompletesWithin(aborted, 'provider did not receive cancellation after continuation revocation');
       releaseProvider();
@@ -1094,7 +1166,7 @@ describe('Tool intercepts', () => {
     let pushed = 0;
     registerToolExecutionIntercept('node_tool_exec_concurrent_next_scopes', 10, async (_args, next) => {
       const [first, second] = await Promise.all([next({ branch: 'first' }), next({ branch: 'second' })]);
-      return { result: [first, second] };
+      return { result: [first.result, second.result] };
     });
     try {
       const result = await toolCallExecuteAsync('concurrent_next_tool', {}, async (args) => {
@@ -1109,12 +1181,12 @@ describe('Tool intercepts', () => {
             await new Promise((resolve) => setImmediate(resolve));
           }
           assert.equal(lib.getHandle().uuid, handle.uuid);
-          return args;
+          return toolResult(args);
         } finally {
           popScope(handle);
         }
       });
-      assert.deepEqual(result, [{ branch: 'first' }, { branch: 'second' }]);
+      assert.deepEqual(result.result, [{ branch: 'first' }, { branch: 'second' }]);
     } finally {
       releaseBoth?.();
       deregisterToolExecutionIntercept('node_tool_exec_concurrent_next_scopes');
@@ -1134,30 +1206,36 @@ describe('Tool intercepts', () => {
     const secondInstalled = new Promise((resolve) => {
       secondStackInstalled = resolve;
     });
+    let parentScope;
 
     registerToolExecutionIntercept('node_tool_exec_concurrent_scope_replacements', 10, async (args, next) => {
-      const first = (async () => {
-        lib.setThreadScopeStack(firstStack);
+      parentScope = lib.getHandle().uuid;
+      const first = lib.withScopeStack(firstStack, async () => {
         firstStackInstalled();
         await secondInstalled;
         return next({ ...args, branch: 'first' });
-      })();
-      const second = (async () => {
+      });
+      const second = lib.withScopeStack(secondStack, async () => {
         await firstInstalled;
-        lib.setThreadScopeStack(secondStack);
         secondStackInstalled();
         return next({ ...args, branch: 'second' });
-      })();
-      return { result: await Promise.all([first, second]) };
+      });
+      const branches = await Promise.all([first, second]);
+      assert.equal(lib.getHandle().uuid, parentScope);
+      const parent = await next({ ...args, branch: 'parent' });
+      return { result: [...branches.map((branch) => branch.result), parent.result] };
     });
     try {
-      const result = await toolCallExecuteAsync('concurrent_scope_replacements_tool', {}, async (args) => ({
-        branch: args.branch,
-        scope: lib.getHandle().uuid,
-      }));
-      assert.deepEqual(result, [
+      const result = await toolCallExecuteAsync('concurrent_scope_replacements_tool', {}, async (args) =>
+        toolResult({
+          branch: args.branch,
+          scope: lib.getHandle().uuid,
+        }),
+      );
+      assert.deepEqual(result.result, [
         { branch: 'first', scope: firstScope },
         { branch: 'second', scope: secondScope },
+        { branch: 'parent', scope: parentScope },
       ]);
     } finally {
       deregisterToolExecutionIntercept('node_tool_exec_concurrent_scope_replacements');
@@ -1190,7 +1268,10 @@ describe('Tool intercepts', () => {
       await new Promise((resolve) => setImmediate(resolve));
       const result = await next(args);
       observed.push([label, 'after', lib.getHandle().uuid]);
-      return { result };
+      return {
+        result: result.result,
+        ...(result.annotation == null ? {} : { annotation: result.annotation }),
+      };
     };
 
     registerToolExecutionIntercept('node_tool_exec_scope_outer', 10, intercept('outer'));
@@ -1198,7 +1279,7 @@ describe('Tool intercepts', () => {
     try {
       const execution = lib.withScopeStack(invocationStack, () => {
         invocationScope = lib.pushScope('execution-intercept-invocation', lib.ScopeType.Agent);
-        return toolCallExecute('execution_intercept_scope', {}, (args) => args);
+        return toolCallExecute('execution_intercept_scope', {}, (args) => toolResult(args));
       });
       lib.setThreadScopeStack(unrelatedStack);
       await execution;
@@ -1228,22 +1309,34 @@ describe('Tool intercepts', () => {
 
     registerToolExecutionIntercept('node_tool_exec_snapshot_target', 100, async (args, next) => ({
       result: {
-        ...(await next(args)),
+        ...(await next(args)).result,
         snapshotted: true,
       },
     }));
     registerToolExecutionIntercept('node_tool_exec_snapshot_blocker', -100, async (args, next) => {
       blockerEntered();
       await release;
-      return { result: await next(args) };
+      const downstream = await next(args);
+      return {
+        result: downstream.result,
+        ...(downstream.annotation == null ? {} : { annotation: downstream.annotation }),
+      };
     });
 
     try {
-      const execution = toolCallExecute('snapshotted_tool', {}, () => ({ downstream: true }), null, null, null, null);
+      const execution = toolCallExecute(
+        'snapshotted_tool',
+        {},
+        () => toolResult({ downstream: true }),
+        null,
+        null,
+        null,
+        null,
+      );
       await entered;
       assert.equal(deregisterToolExecutionIntercept('node_tool_exec_snapshot_target'), true);
       releaseBlocker();
-      assert.deepEqual(await execution, {
+      assert.deepEqual((await execution).result, {
         downstream: true,
         snapshotted: true,
       });

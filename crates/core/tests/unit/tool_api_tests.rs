@@ -55,14 +55,15 @@ fn tool_call_execute_adds_otel_status_metadata_to_end_events() {
                 .name("tool-ok")
                 .args(json!({"value": 1}))
                 .func(Arc::new(|_args| {
-                    Box::pin(async { Ok(json!({"ok": true})) })
+                    Box::pin(async { Ok(json!({"ok": true}).into()) })
                 }))
                 .metadata(json!({"caller": "tool-ok", "otel.status_code": "USER"}))
                 .build(),
         )
         .await
         .unwrap();
-        assert_eq!(result, json!({"ok": true}));
+        assert_eq!(result.result, json!({"ok": true}));
+        assert!(result.annotation.is_none());
 
         let error = tool_call_execute(
             ToolCallExecuteParams::builder()
@@ -99,6 +100,7 @@ fn tool_call_execute_adds_otel_status_metadata_to_end_events() {
     let error_metadata = metadata_for("tool-error");
     assert_eq!(error_metadata["caller"], json!("tool-error"));
     assert_eq!(error_metadata["otel.status_code"], json!("ERROR"));
+    assert_eq!(error_metadata["error.type"], json!("internal_error"));
     assert!(
         error_metadata["otel.status_description"]
             .as_str()

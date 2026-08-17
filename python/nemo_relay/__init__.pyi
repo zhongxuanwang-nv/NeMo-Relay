@@ -124,6 +124,9 @@ from nemo_relay._native import (
     ToolExecutionInterceptOutcome as ToolExecutionInterceptOutcome,
 )
 from nemo_relay._native import (
+    ToolExecutionResult as ToolExecutionResult,
+)
+from nemo_relay._native import (
     ToolHandle as ToolHandle,
 )
 
@@ -171,7 +174,8 @@ Return:
     JSON payload recorded on the emitted lifecycle event.
 
 Exceptional flow:
-    Exceptions fail open and preserve the last valid observability payload.
+    Exceptions fail closed, omit the observability payload, and stop the
+    remaining sanitizer chain.
 """
 EventSanitizeGuardrail: TypeAlias = Callable[
     [Event, EventSanitizeFields],
@@ -186,7 +190,8 @@ Return:
     Observability fields recorded on the asynchronously published event.
 
 Exceptional flow:
-    Exceptions fail open and preserve the last valid event snapshot.
+    Exceptions fail closed, clear the mutable observability fields, and stop
+    the remaining sanitizer chain.
 """
 ToolConditionalExecutionGuardrail: TypeAlias = Callable[[str, Json], Optional[str] | Awaitable[Optional[str]]]
 """Guardrail callback that can block tool execution.
@@ -212,6 +217,10 @@ Arguments:
 Return:
     Request object recorded on the emitted lifecycle event, or ``None`` to omit
     the LLM observability payload and annotation.
+
+Exceptional flow:
+    Exceptions fail closed, omit the payload and annotation, and stop the
+    remaining sanitizer chain.
 """
 LlmSanitizeResponseGuardrail: TypeAlias = Callable[
     [Json, "LlmSanitizeResponseContext"],
@@ -228,6 +237,10 @@ Arguments:
 Return:
     Response object recorded on the emitted lifecycle event, or ``None`` to
     omit the LLM observability payload and annotation.
+
+Exceptional flow:
+    Exceptions fail closed, omit the payload and annotation, and stop the
+    remaining sanitizer chain.
 """
 LlmConditionalExecutionGuardrail: TypeAlias = Callable[[LLMRequest], Optional[str] | Awaitable[Optional[str]]]
 """Guardrail callback that can block an LLM call.
@@ -248,7 +261,7 @@ Return:
     JSON payload passed to later request intercepts and tool execution.
 """
 ToolExecutionIntercept: TypeAlias = Callable[
-    [str, Json, Callable[[Json], Awaitable[Json]]],
+    [str, Json, Callable[[Json], Awaitable[ToolExecutionResult[Json]]]],
     ToolExecutionInterceptOutcome | Awaitable[ToolExecutionInterceptOutcome],
 ]
 """Execution intercept callback that wraps tool execution.
@@ -386,6 +399,7 @@ def create_scope_stack() -> ScopeStack:
 
 def capture_propagation_context() -> PropagationContext: ...
 def capture_propagation_context_with_root(root_uuid: str | None) -> PropagationContext: ...
+def capture_traceparent() -> str: ...
 def create_scope_stack_from_propagation(context: PropagationContext) -> ScopeStack: ...
 def fork_asyncio_context() -> contextvars.Context:
     """Create a child asyncio context with an isolated Relay scope stack.

@@ -42,11 +42,19 @@ OpenTelemetry projections.
   concatenate with higher-precedence entries first?
 - [ ] Are OpenTelemetry and OpenInference dependencies unconditional rather
   than Cargo feature-gated?
-- [ ] Does `gen_ai` avoid `nemo_relay.*` and content-capture attributes while
-  preserving descendants through omitted scopes?
+- [ ] Does `gen_ai` avoid `nemo_relay.*`, project sanitized LLM instructions
+  and messages into the standard content attributes, and emit minimal spans
+  for scopes without GenAI semantics so their parentage is preserved?
+- [ ] Does `enable_full_payloads` preserve complete sanitized LLM request input
+  and annotations while leaving credential removal and sanitizers active?
 - [ ] Does Relay derive compliant trace and span IDs consistently across typed
   OpenTelemetry endpoints while preserving lifecycle parentage?
 - [ ] Are mark events, start/end events, and orphan cases still handled correctly?
+- [ ] Does a sanitized tool result annotation remain opaque under
+      `category_profile.tool_result_annotation`, ATIF observation-result
+      `extra.tool_result_annotation`, and the single
+      `nemo_relay.tool.result.annotation` attribute in `full` and
+      `openinference`, while `gen_ai` omits it?
 - [ ] Do examples and docs use each exporter's documented flush/deregister
   order before shutdown?
 - [ ] Are span or trajectory fields still derived from the intended event data?

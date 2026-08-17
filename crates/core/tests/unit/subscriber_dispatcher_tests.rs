@@ -2,14 +2,38 @@
 // SPDX-License-Identifier: Apache-2.0
 use super::native::{
     DispatcherLoopState, DispatcherMessage, PendingFlush, PublicationLineage, PublicationPermit,
-    dispatcher_sender, enqueue_dispatch_message, flush_subscribers, register_async_publication,
-    sanitize_event_snapshot, set_sanitizer_runtime_failure_for_test, spawn_background_publication,
+    dispatch_sanitized_event_with_delivery, dispatcher_sender, enqueue_dispatch_message,
+    flush_queued_subscribers, flush_subscribers, prepare_for_fork, register_async_publication,
+    register_pending_publication, resume_after_fork_parent, sanitize_event_snapshot,
+    set_sanitizer_runtime_failure_for_test, spawn_background_publication,
 };
-use super::{EventSubscriberFn, publication_context};
+use super::{EventSubscriberFn, SubscriberDelivery, publication_context, with_publication_context};
 use crate::api::registry::RegistryRecord;
 use crate::api::runtime::EventSanitizeFn;
 use crate::api::runtime::scope_stack::current_scope_stack;
 use std::sync::{Arc, Mutex, mpsc};
+
+#[test]
+fn publication_context_and_completed_delivery_restore_the_calling_thread() {
+    assert!(publication_context::<String>().is_none());
+    let observed = with_publication_context(Some(Arc::new("binding".to_string())), || {
+        publication_context::<String>().map(|value| value.as_str().to_string())
+    });
+    assert_eq!(observed.as_deref(), Some("binding"));
+    assert!(publication_context::<String>().is_none());
+    futures::executor::block_on(SubscriberDelivery::completed().wait()).unwrap();
+}
+
+#[test]
+fn subscriber_dispatcher_parent_fork_hooks_validate_balanced_calls() {
+    let _lock = crate::shared_runtime::runtime_owner_test_mutex()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    prepare_for_fork();
+    assert!(std::panic::catch_unwind(prepare_for_fork).is_err());
+    resume_after_fork_parent();
+    assert!(std::panic::catch_unwind(resume_after_fork_parent).is_err());
+}
 
 #[test]
 fn flush_waits_for_active_but_not_later_publication_barriers() {
@@ -46,11 +70,15 @@ fn flush_waits_for_active_but_not_later_publication_barriers() {
             scope_stack: current_scope_stack(),
             publication_context: None,
             lineage: None,
+            completion: None,
         })
         .unwrap();
     let (flush_tx, flush_rx) = mpsc::channel();
     sender
-        .send(DispatcherMessage::Flush { done: flush_tx })
+        .send(DispatcherMessage::Flush {
+            done: flush_tx,
+            include_pending: true,
+        })
         .unwrap();
     let later = register_async_publication().expect("later publication barrier");
 
@@ -78,6 +106,7 @@ fn flush_waits_for_active_but_not_later_publication_barriers() {
             scope_stack: current_scope_stack(),
             publication_context: None,
             lineage: None,
+            completion: None,
         }])
         .unwrap();
     flush_rx
@@ -93,6 +122,62 @@ fn flush_waits_for_active_but_not_later_publication_barriers() {
 }
 
 #[test]
+fn pending_publication_defers_flush_without_blocking_unrelated_delivery() {
+    let _lock = crate::shared_runtime::runtime_owner_test_mutex()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    flush_subscribers().unwrap();
+    let pending = register_pending_publication().expect("pending publication");
+    let (delivered_tx, delivered_rx) = mpsc::channel();
+    let subscriber: EventSubscriberFn = Arc::new(move |_event| {
+        delivered_tx.send(()).unwrap();
+    });
+    let event = serde_json::from_value(serde_json::json!({
+        "kind": "mark",
+        "atof_version": "0.1",
+        "uuid": "019c1df6-4a57-7000-8000-000000000004",
+        "timestamp": "2026-07-28T00:00:00Z",
+        "name": "unrelated-while-pending"
+    }))
+    .expect("valid event");
+    enqueue_dispatch_message(DispatcherMessage::Deliver {
+        event: Box::new(event),
+        transform: None,
+        sanitizers: Vec::new(),
+        subscribers: vec![subscriber],
+        scope_stack: current_scope_stack(),
+        publication_context: None,
+        lineage: None,
+        completion: None,
+    });
+    delivered_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("pending publication must not block unrelated delivery");
+    flush_queued_subscribers().expect("queued-only flush must ignore managed work");
+
+    let (flush_tx, flush_rx) = mpsc::channel();
+    dispatcher_sender()
+        .expect("dispatcher sender")
+        .send(DispatcherMessage::Flush {
+            done: flush_tx,
+            include_pending: true,
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            flush_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "flush must wait for work registered before it"
+    );
+
+    drop(pending);
+    flush_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("flush must complete after pending work");
+}
+
+#[test]
 fn flush_does_not_wait_for_later_delivery() {
     let _lock = crate::shared_runtime::runtime_owner_test_mutex()
         .lock()
@@ -102,7 +187,10 @@ fn flush_does_not_wait_for_later_delivery() {
     let sender = dispatcher_sender().expect("dispatcher sender");
     let (flush_tx, flush_rx) = mpsc::channel();
     sender
-        .send(DispatcherMessage::Flush { done: flush_tx })
+        .send(DispatcherMessage::Flush {
+            done: flush_tx,
+            include_pending: true,
+        })
         .unwrap();
 
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -128,6 +216,7 @@ fn flush_does_not_wait_for_later_delivery() {
             scope_stack: current_scope_stack(),
             publication_context: None,
             lineage: None,
+            completion: None,
         })
         .unwrap();
     barrier.sender.send(Vec::new()).unwrap();
@@ -139,6 +228,128 @@ fn flush_does_not_wait_for_later_delivery() {
         flush_result.is_ok(),
         "a delivery queued after a flush must not delay that flush"
     );
+}
+
+#[test]
+fn subscriber_delivery_receipt_waits_for_its_event() {
+    let _lock = crate::shared_runtime::runtime_owner_test_mutex()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    flush_subscribers().unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let subscriber: EventSubscriberFn = Arc::new(move |_event| {
+        started_tx.send(()).unwrap();
+        release_rx
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .recv()
+            .unwrap();
+    });
+    let event = serde_json::from_value(serde_json::json!({
+        "kind": "mark",
+        "atof_version": "0.1",
+        "uuid": "019c1df6-4a57-7000-8000-000000000017",
+        "timestamp": "2026-07-28T00:00:00Z",
+        "name": "tracked-delivery"
+    }))
+    .expect("valid event");
+    let delivery = dispatch_sanitized_event_with_delivery(
+        event,
+        Vec::new(),
+        &[subscriber],
+        current_scope_stack(),
+    )
+    .unwrap();
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("tracked subscriber should start");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let mut wait = Box::pin(delivery.wait());
+    assert!(
+        runtime
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_millis(50), wait.as_mut()).await
+            })
+            .is_err(),
+        "delivery receipt must remain pending while its subscriber is active"
+    );
+    release_tx.send(()).unwrap();
+    runtime
+        .block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), wait.as_mut()).await
+        })
+        .expect("delivery receipt should complete after subscriber delivery")
+        .unwrap();
+    flush_subscribers().unwrap();
+}
+
+#[test]
+fn subscriber_delivery_receipt_does_not_capture_later_events() {
+    let _lock = crate::shared_runtime::runtime_owner_test_mutex()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    flush_subscribers().unwrap();
+    let event = |uuid: &str, name: &str| {
+        serde_json::from_value(serde_json::json!({
+            "kind": "mark",
+            "atof_version": "0.1",
+            "uuid": uuid,
+            "timestamp": "2026-07-28T00:00:00Z",
+            "name": name
+        }))
+        .expect("valid event")
+    };
+    let delivery = dispatch_sanitized_event_with_delivery(
+        event("019c1df6-4a57-7000-8000-000000000018", "tracked"),
+        Vec::new(),
+        &[Arc::new(|_event| {})],
+        current_scope_stack(),
+    )
+    .unwrap();
+
+    let (later_started_tx, later_started_rx) = mpsc::channel();
+    let (release_later_tx, release_later_rx) = mpsc::channel();
+    enqueue_dispatch_message(DispatcherMessage::Deliver {
+        event: Box::new(event(
+            "019c1df6-4a57-7000-8000-000000000019",
+            "later-blocked",
+        )),
+        transform: Some(Box::new(move |event| {
+            Box::pin(async move {
+                later_started_tx.send(()).unwrap();
+                release_later_rx.recv().unwrap();
+                event
+            })
+        })),
+        sanitizers: Vec::new(),
+        subscribers: Vec::new(),
+        scope_stack: current_scope_stack(),
+        publication_context: None,
+        lineage: None,
+        completion: None,
+    });
+    later_started_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("later delivery should block the dispatcher");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let result = runtime.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_millis(100), delivery.wait()).await
+    });
+    release_later_tx.send(()).unwrap();
+    flush_subscribers().unwrap();
+    result
+        .expect("tracked delivery must not wait for a later queued event")
+        .unwrap();
 }
 
 #[test]
@@ -237,6 +448,7 @@ fn nested_publication_barrier_precedes_already_queued_delivery() {
                         scope_stack: nested_scope_stack.clone(),
                         publication_context: None,
                         lineage: None,
+                        completion: None,
                     }));
                     let publication =
                         register_async_publication().expect("nested publication barrier");
@@ -259,6 +471,7 @@ fn nested_publication_barrier_precedes_already_queued_delivery() {
                             scope_stack: nested_scope_stack,
                             publication_context: None,
                             lineage: None,
+                            completion: None,
                         }])
                         .unwrap();
                     event
@@ -269,6 +482,7 @@ fn nested_publication_barrier_precedes_already_queued_delivery() {
             scope_stack: current_scope_stack(),
             publication_context: None,
             lineage: None,
+            completion: None,
         })
         .unwrap();
     started_rx
@@ -283,6 +497,7 @@ fn nested_publication_barrier_precedes_already_queued_delivery() {
             scope_stack: current_scope_stack(),
             publication_context: None,
             lineage: None,
+            completion: None,
         })
         .unwrap();
     release_tx.send(()).unwrap();
@@ -301,6 +516,9 @@ fn flush_waits_for_transitive_subscriber_publications_without_reordering() {
     flush_subscribers().unwrap();
     let sender = dispatcher_sender().expect("dispatcher sender");
     let delivered = Arc::new(Mutex::new(Vec::new()));
+    let (outer_started_tx, outer_started_rx) = mpsc::channel();
+    let (release_outer_tx, release_outer_rx) = mpsc::channel();
+    let release_outer_rx = Arc::new(Mutex::new(release_outer_rx));
     let event = |uuid: &str, name: &str| {
         serde_json::from_value(serde_json::json!({
             "kind": "mark",
@@ -346,17 +564,27 @@ fn flush_waits_for_transitive_subscriber_publications_without_reordering() {
                 scope_stack: current_scope_stack(),
                 publication_context: None,
                 lineage: None,
+                completion: None,
             }));
         })
     };
     let outer_subscriber: EventSubscriberFn = {
         let delivered = Arc::clone(&delivered);
         let child_subscriber = child_subscriber.clone();
+        let release_outer_rx = Arc::clone(&release_outer_rx);
         Arc::new(move |event| {
             delivered
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .push(event.name().to_string());
+            outer_started_tx
+                .send(())
+                .expect("outer subscriber start receiver was dropped");
+            release_outer_rx
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("outer subscriber was not released within 2 seconds");
             assert!(enqueue_dispatch_message(DispatcherMessage::Deliver {
                 event: Box::new(
                     serde_json::from_value(serde_json::json!({
@@ -374,6 +602,7 @@ fn flush_waits_for_transitive_subscriber_publications_without_reordering() {
                 scope_stack: current_scope_stack(),
                 publication_context: None,
                 lineage: None,
+                completion: None,
             }));
         })
     };
@@ -396,8 +625,12 @@ fn flush_waits_for_transitive_subscriber_publications_without_reordering() {
             scope_stack: current_scope_stack(),
             publication_context: None,
             lineage: None,
+            completion: None,
         })
         .unwrap();
+    outer_started_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("outer subscriber did not start within 2 seconds");
     sender
         .send(DispatcherMessage::Deliver {
             event: Box::new(event("019c1df6-4a57-7000-8000-000000000011", "later")),
@@ -407,8 +640,12 @@ fn flush_waits_for_transitive_subscriber_publications_without_reordering() {
             scope_stack: current_scope_stack(),
             publication_context: None,
             lineage: None,
+            completion: None,
         })
         .unwrap();
+    release_outer_tx
+        .send(())
+        .expect("outer subscriber release receiver was dropped");
 
     flush_subscribers().unwrap();
     assert_eq!(
@@ -452,7 +689,7 @@ fn detached_publications_share_one_background_executor_thread() {
 }
 
 #[test]
-fn sanitizer_runtime_failure_preserves_untransformed_event_snapshot() {
+fn sanitizer_runtime_failure_clears_untransformed_event_fields() {
     let _lock = crate::shared_runtime::runtime_owner_test_mutex()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -461,7 +698,9 @@ fn sanitizer_runtime_failure_preserves_untransformed_event_snapshot() {
         "atof_version": "0.1",
         "uuid": "019c1df6-4a57-7000-8000-000000000008",
         "timestamp": "2026-07-28T00:00:00Z",
-        "name": "fail-open-runtime"
+        "name": "fail-closed-runtime",
+        "data": {"secret": true},
+        "metadata": {"secret": true}
     }))
     .expect("valid event");
     let sanitizer: EventSanitizeFn = Arc::new(|_, _| {
@@ -479,7 +718,10 @@ fn sanitizer_runtime_failure_preserves_untransformed_event_snapshot() {
     );
     set_sanitizer_runtime_failure_for_test(None);
 
-    assert_eq!(published, Some(event));
+    let published = published.expect("sanitizer runtime failure still publishes the event shell");
+    assert_eq!(published.name(), event.name());
+    assert_eq!(published.data(), None);
+    assert_eq!(published.metadata(), None);
     assert!(nested.is_empty());
 }
 
@@ -621,7 +863,10 @@ fn detached_sanitizer_tasks_cannot_inherit_a_later_publication_context() {
                     .send(publication_context::<String>().map(|value| value.as_str().to_string()))
                     .unwrap();
                 let (done, _ignored) = mpsc::channel();
-                enqueue_dispatch_message(DispatcherMessage::Flush { done });
+                enqueue_dispatch_message(DispatcherMessage::Flush {
+                    done,
+                    include_pending: true,
+                });
             });
             Ok(fields)
         })

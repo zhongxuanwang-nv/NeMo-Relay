@@ -20,8 +20,9 @@ use std::task::{Context, Poll};
 use futures_util::{FutureExt, Stream};
 
 use crate::api::event::{
-    BaseEvent, CategoryProfile, Event, EventCategory, MarkEvent, ScopeCategory, ScopeEvent,
-    llm_attributes_to_strings, scope_attributes_to_strings, tool_attributes_to_strings,
+    BaseEvent, CategoryProfile, Event, EventCategory, EventSanitizeFields, MarkEvent,
+    ScopeCategory, ScopeEvent, llm_attributes_to_strings, scope_attributes_to_strings,
+    tool_attributes_to_strings,
 };
 use crate::api::llm::{CreateLlmHandleParams, EndLlmHandleParams};
 use crate::api::llm::{LlmHandle, LlmRequest};
@@ -155,6 +156,7 @@ struct GuardrailScopeCompletion<'a> {
     handle: Option<ScopeHandle>,
     subscribers: &'a [EventSubscriberFn],
     scope_stack: ScopeStackHandle,
+    pending_publication: Option<subscriber_dispatcher::PendingPublication>,
 }
 
 impl GuardrailScopeCompletion<'_> {
@@ -167,6 +169,9 @@ impl GuardrailScopeCompletion<'_> {
             handle: Some(handle),
             subscribers,
             scope_stack,
+            pending_publication: (!subscribers.is_empty())
+                .then(subscriber_dispatcher::register_pending_publication)
+                .flatten(),
         }
     }
 
@@ -178,6 +183,7 @@ impl GuardrailScopeCompletion<'_> {
             self.subscribers,
             self.scope_stack.clone(),
         );
+        drop(self.pending_publication.take());
     }
 }
 
@@ -196,6 +202,7 @@ impl Drop for GuardrailScopeCompletion<'_> {
             self.subscribers,
             self.scope_stack.clone(),
         );
+        drop(self.pending_publication.take());
     }
 }
 
@@ -236,6 +243,8 @@ pub struct NemoRelayContextState {
         SortedRegistry<ExecutionIntercept<LlmStreamExecutionFn>>,
     /// Global lifecycle subscribers notified after runtime events are emitted.
     pub(crate) event_subscribers: HashMap<String, EventSubscriberFn>,
+    /// Whether LLM start events retain complete sanitized request payloads.
+    pub(crate) observability_full_payloads_enabled: bool,
     /// Arbitrary binding- or integration-specific runtime extensions.
     pub(crate) extensions: HashMap<String, Box<dyn Any + Send + Sync>>,
 }
@@ -263,6 +272,7 @@ impl NemoRelayContextState {
             llm_execution_intercepts: SortedRegistry::new(),
             llm_stream_execution_intercepts: SortedRegistry::new(),
             event_subscribers: HashMap::new(),
+            observability_full_payloads_enabled: false,
             extensions: HashMap::new(),
         }
     }
@@ -600,6 +610,7 @@ impl NemoRelayContextState {
     /// A new [`LlmHandle`] with a fresh UUID.
     pub fn create_llm_handle(&self, params: CreateLlmHandleParams<'_>) -> LlmHandle {
         LlmHandle::builder()
+            .uuid(params.uuid.unwrap_or_else(Uuid::now_v7))
             .name(params.name)
             .started_at(params.timestamp.unwrap_or_else(Utc::now))
             .attributes(params.attributes)
@@ -804,20 +815,28 @@ impl NemoRelayContextState {
             event = Arc::try_unwrap(context).unwrap_or_else(|context| (*context).clone());
             match outcome {
                 Ok(Ok(fields)) => event.apply_sanitize_fields(fields),
-                Ok(Err(error)) => log::error!(
-                    target: "nemo_relay.runtime",
-                    event = "event_sanitizer_failed",
-                    sanitizer = entry.name.as_str(),
-                    event_name = event.name();
-                    "Event sanitizer failed; preserving the last valid event snapshot: {error}"
-                ),
-                Err(_) => log::error!(
-                    target: "nemo_relay.runtime",
-                    event = "event_sanitizer_panicked",
-                    sanitizer = entry.name.as_str(),
-                    event_name = event.name();
-                    "Event sanitizer panicked; publishing the latest valid event snapshot"
-                ),
+                Ok(Err(_error)) => {
+                    log::error!(
+                        target: "nemo_relay.runtime",
+                        event = "event_sanitizer_failed",
+                        sanitizer = entry.name.as_str(),
+                        event_name = event.name();
+                        "Event sanitizer failed; clearing observability fields"
+                    );
+                    event.apply_sanitize_fields(EventSanitizeFields::default());
+                    break;
+                }
+                Err(_) => {
+                    log::error!(
+                        target: "nemo_relay.runtime",
+                        event = "event_sanitizer_panicked",
+                        sanitizer = entry.name.as_str(),
+                        event_name = event.name();
+                        "Event sanitizer panicked; clearing observability fields"
+                    );
+                    event.apply_sanitize_fields(EventSanitizeFields::default());
+                    break;
+                }
             }
         }
         event
@@ -850,36 +869,38 @@ impl NemoRelayContextState {
     /// - `entries`: Sanitizer snapshots to evaluate.
     ///
     /// # Returns
-    /// The sanitized JSON payload after every provided guardrail has run.
+    /// The sanitized JSON payload after every provided guardrail has run, or
+    /// `None` when a sanitizer failure omits the payload.
     pub(crate) async fn tool_sanitize_request_snapshot_chain(
         name: &str,
         args: Json,
         entries: &[Guardrail<ToolSanitizeFn>],
-    ) -> Json {
-        let mut value = args;
+    ) -> Option<Json> {
+        let mut value = Some(args);
         for entry in entries {
-            let callback = Arc::clone(&entry.payload);
-            let callback_name = name.to_string();
-            let current = value.clone();
-            match AssertUnwindSafe(async move { callback(callback_name, current).await })
-                .catch_unwind()
-                .await
-            {
-                Ok(Ok(next)) => value = next,
-                Ok(Err(error)) => log::error!(
-                    target: "nemo_relay.runtime",
-                    event = "tool_request_sanitizer_failed",
-                    sanitizer = entry.name.as_str(),
-                    tool_name = name;
-                    "Tool request sanitizer failed; preserving the last valid payload: {error}"
-                ),
-                Err(_) => log::error!(
-                    target: "nemo_relay.runtime",
-                    event = "tool_request_sanitizer_panicked",
-                    sanitizer = entry.name.as_str(),
-                    tool_name = name;
-                    "Tool request sanitizer panicked; preserving the last valid payload"
-                ),
+            if let Some(current) = value.take() {
+                let callback = Arc::clone(&entry.payload);
+                let callback_name = name.to_string();
+                match AssertUnwindSafe(async move { callback(callback_name, current).await })
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(next)) => value = Some(next),
+                    Ok(Err(_error)) => log::error!(
+                        target: "nemo_relay.runtime",
+                        event = "tool_request_sanitizer_failed",
+                        sanitizer = entry.name.as_str(),
+                        tool_name = name;
+                        "Tool request sanitizer failed; omitting the observability payload"
+                    ),
+                    Err(_) => log::error!(
+                        target: "nemo_relay.runtime",
+                        event = "tool_request_sanitizer_panicked",
+                        sanitizer = entry.name.as_str(),
+                        tool_name = name;
+                        "Tool request sanitizer panicked; omitting the observability payload"
+                    ),
+                }
             }
         }
         value
@@ -908,40 +929,43 @@ impl NemoRelayContextState {
     ///
     /// # Parameters
     /// - `name`: Tool name associated with the response.
-    /// - `result`: Raw tool result to sanitize for observability.
+    /// - `result`: Application-owned tool result JSON to sanitize for
+    ///   observability.
     /// - `entries`: Sanitizer snapshots to evaluate.
     ///
     /// # Returns
-    /// The sanitized JSON payload after every provided guardrail has run.
+    /// The sanitized JSON payload after every provided guardrail has run, or
+    /// `None` when a sanitizer failure omits the payload.
     pub(crate) async fn tool_sanitize_response_snapshot_chain(
         name: &str,
         result: Json,
         entries: &[Guardrail<ToolSanitizeFn>],
-    ) -> Json {
-        let mut value = result;
+    ) -> Option<Json> {
+        let mut value = Some(result);
         for entry in entries {
-            let callback = Arc::clone(&entry.payload);
-            let callback_name = name.to_string();
-            let current = value.clone();
-            match AssertUnwindSafe(async move { callback(callback_name, current).await })
-                .catch_unwind()
-                .await
-            {
-                Ok(Ok(next)) => value = next,
-                Ok(Err(error)) => log::error!(
-                    target: "nemo_relay.runtime",
-                    event = "tool_response_sanitizer_failed",
-                    sanitizer = entry.name.as_str(),
-                    tool_name = name;
-                    "Tool response sanitizer failed; preserving the last valid payload: {error}"
-                ),
-                Err(_) => log::error!(
-                    target: "nemo_relay.runtime",
-                    event = "tool_response_sanitizer_panicked",
-                    sanitizer = entry.name.as_str(),
-                    tool_name = name;
-                    "Tool response sanitizer panicked; preserving the last valid payload"
-                ),
+            if let Some(current) = value.take() {
+                let callback = Arc::clone(&entry.payload);
+                let callback_name = name.to_string();
+                match AssertUnwindSafe(async move { callback(callback_name, current).await })
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(next)) => value = Some(next),
+                    Ok(Err(_error)) => log::error!(
+                        target: "nemo_relay.runtime",
+                        event = "tool_response_sanitizer_failed",
+                        sanitizer = entry.name.as_str(),
+                        tool_name = name;
+                        "Tool response sanitizer failed; omitting the observability payload"
+                    ),
+                    Err(_) => log::error!(
+                        target: "nemo_relay.runtime",
+                        event = "tool_response_sanitizer_panicked",
+                        sanitizer = entry.name.as_str(),
+                        tool_name = name;
+                        "Tool response sanitizer panicked; omitting the observability payload"
+                    ),
+                }
             }
         }
         value
@@ -1138,7 +1162,7 @@ impl NemoRelayContextState {
             Box::pin(async move {
                 default_fn(args)
                     .await
-                    .map(ToolExecutionInterceptOutcome::new)
+                    .map(ToolExecutionInterceptOutcome::from)
             })
         });
         let name = name.to_string();
@@ -1162,12 +1186,14 @@ impl NemoRelayContextState {
                         let invocation = continuation.begin();
                         let downstream_marks = downstream_marks.clone();
                         Box::pin(async move {
-                            let outcome = invocation?.invoke(move || current_next(args)).await?;
+                            let mut outcome =
+                                invocation?.invoke(move || current_next(args)).await?;
+                            let pending_marks = std::mem::take(&mut outcome.pending_marks);
                             downstream_marks
                                 .lock()
                                 .expect("tool pending mark accumulator lock poisoned")
-                                .push((sequence, outcome.pending_marks));
-                            Ok(outcome.result)
+                                .push((sequence, pending_marks));
+                            Ok(outcome.into_execution_result())
                         })
                     })
                 };
@@ -1220,7 +1246,8 @@ impl NemoRelayContextState {
     /// - `entries`: Sanitizer snapshots to evaluate.
     ///
     /// # Returns
-    /// The sanitized [`LlmRequest`] after every provided guardrail has run.
+    /// The sanitized [`LlmRequest`] after every provided guardrail has run, or
+    /// `None` when a sanitizer errors or panics.
     pub(crate) async fn llm_sanitize_request_snapshot_chain(
         request: LlmRequest,
         context: LlmSanitizeRequestContext,
@@ -1239,24 +1266,21 @@ impl NemoRelayContextState {
                 .await
                 {
                     Ok(Ok(next)) => value = next,
-                    Ok(Err(error)) => {
+                    Ok(Err(_error)) => {
                         log::error!(
                             target: "nemo_relay.runtime",
                             event = "llm_request_sanitizer_failed",
-                            sanitizer = entry.name.as_str(),
-                            preserved_value = "last_valid_request";
-                            "LLM request sanitizer failed; preserving the last valid request: {error}"
+                            sanitizer = entry.name.as_str();
+                            "LLM request sanitizer failed; omitting the observability payload"
                         );
-                        value = Some(current);
                     }
                     Err(_) => {
                         log::error!(
                             target: "nemo_relay.runtime",
                             event = "llm_request_sanitizer_panicked",
                             sanitizer = entry.name.as_str();
-                            "LLM request sanitizer panicked; preserving the last valid request"
+                            "LLM request sanitizer panicked; omitting the observability payload"
                         );
-                        value = Some(current);
                     }
                 }
             }
@@ -1290,7 +1314,8 @@ impl NemoRelayContextState {
     /// - `entries`: Sanitizer snapshots to evaluate.
     ///
     /// # Returns
-    /// The sanitized response payload after every provided guardrail has run.
+    /// The sanitized response payload after every provided guardrail has run,
+    /// or `None` when a sanitizer errors or panics.
     pub(crate) async fn llm_sanitize_response_snapshot_chain(
         response: Json,
         context: LlmSanitizeResponseContext,
@@ -1309,24 +1334,21 @@ impl NemoRelayContextState {
                 .await
                 {
                     Ok(Ok(next)) => value = next,
-                    Ok(Err(error)) => {
+                    Ok(Err(_error)) => {
                         log::error!(
                             target: "nemo_relay.runtime",
                             event = "llm_response_sanitizer_failed",
-                            sanitizer = entry.name.as_str(),
-                            preserved_value = "last_valid_response";
-                            "LLM response sanitizer failed; preserving the last valid response: {error}"
+                            sanitizer = entry.name.as_str();
+                            "LLM response sanitizer failed; omitting the observability payload"
                         );
-                        value = Some(current);
                     }
                     Err(_) => {
                         log::error!(
                             target: "nemo_relay.runtime",
                             event = "llm_response_sanitizer_panicked",
                             sanitizer = entry.name.as_str();
-                            "LLM response sanitizer panicked; preserving the last valid response"
+                            "LLM response sanitizer panicked; omitting the observability payload"
                         );
-                        value = Some(current);
                     }
                 }
             }

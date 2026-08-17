@@ -32,6 +32,7 @@ use crate::api::scope::{COMPACTION_EVENT_NAME, EmitMarkEventParams, event};
 use crate::api::scope::{PopScopeParams, PushScopeParams, ScopeType, pop_scope, push_scope};
 use crate::api::subscriber::{deregister_subscriber, flush_subscribers, register_subscriber};
 use crate::codec::anthropic::AnthropicMessagesCodec;
+use crate::codec::oci_genai::OCIGenAIChatCodec;
 use crate::codec::openai_chat::OpenAIChatCodec;
 use crate::codec::openai_responses::OpenAIResponsesCodec;
 use crate::codec::request::{AnnotatedLlmRequest, Message, MessageContent};
@@ -74,6 +75,7 @@ fn request_with_credential_headers() -> LlmRequest {
         ("API-KEY", "api-key-secret"),
         ("Anthropic-Api-Key", "anthropic-api-key-secret"),
         ("X-GoOg-Api-Key", "x-goog-api-key-secret"),
+        ("TraceParent", "user-provided-traceparent"),
     ] {
         headers.insert(name.to_string(), json!(value));
     }
@@ -85,10 +87,14 @@ fn request_with_credential_headers() -> LlmRequest {
 }
 
 fn assert_observable_credential_headers_are_removed(request: &LlmRequest) {
-    assert_eq!(request.headers.len(), 1);
+    assert_eq!(request.headers.len(), 2);
     assert_eq!(
         request.headers.get("x-request-id"),
         Some(&json!("safe-request-id"))
+    );
+    assert_eq!(
+        request.headers.get("TraceParent"),
+        Some(&json!("user-provided-traceparent"))
     );
 }
 
@@ -146,7 +152,7 @@ impl LlmResponseCodec for RuntimeIdentityCodec {
 }
 
 #[test]
-fn sanitizer_context_preserves_all_codec_identity_states() {
+fn request_sanitizer_context_preserves_all_codec_identity_states() {
     let identity_only_request = crate::api::runtime::LlmSanitizeRequestContext::with_identity(
         LlmCodecIdentity::Runtime("identity-only.request.v1".into()),
     );
@@ -155,15 +161,7 @@ fn sanitizer_context_preserves_all_codec_identity_states() {
         &LlmCodecIdentity::Runtime("identity-only.request.v1".into())
     );
     assert!(identity_only_request.resolve_codec().is_none());
-
-    let identity_only_response = crate::api::runtime::LlmSanitizeResponseContext::with_identity(
-        LlmCodecIdentity::Runtime("identity-only.response.v1".into()),
-    );
-    assert_eq!(
-        identity_only_response.codec(),
-        &LlmCodecIdentity::Runtime("identity-only.response.v1".into())
-    );
-    assert!(identity_only_response.resolve_codec().is_none());
+    assert!(format!("{identity_only_request:?}").contains("identity-only.request.v1"));
 
     assert_eq!(
         sanitize_context_for_request_codec(None).codec(),
@@ -182,6 +180,10 @@ fn sanitizer_context_preserves_all_codec_identity_states() {
         &LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::AnthropicMessages)
     );
     assert_eq!(
+        sanitize_context_for_request_codec(Some(&OCIGenAIChatCodec)).codec(),
+        &LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OCIGenAI)
+    );
+    assert_eq!(
         sanitize_context_for_request_codec(Some(&RuntimeIdentityCodec)).codec(),
         &LlmCodecIdentity::Runtime("com.example.chat.v1".into())
     );
@@ -192,6 +194,20 @@ fn sanitizer_context_preserves_all_codec_identity_states() {
         .codec(),
         &LlmCodecIdentity::Opaque
     );
+}
+
+#[test]
+fn response_sanitizer_context_preserves_all_codec_identity_states() {
+    let identity_only_response = crate::api::runtime::LlmSanitizeResponseContext::with_identity(
+        LlmCodecIdentity::Runtime("identity-only.response.v1".into()),
+    );
+    assert_eq!(
+        identity_only_response.codec(),
+        &LlmCodecIdentity::Runtime("identity-only.response.v1".into())
+    );
+    assert!(identity_only_response.resolve_codec().is_none());
+    assert!(format!("{identity_only_response:?}").contains("identity-only.response.v1"));
+
     assert_eq!(
         sanitize_context_for_response_codec(Some(&OpenAIChatCodec as &dyn LlmResponseCodec))
             .codec(),
@@ -206,6 +222,11 @@ fn sanitizer_context_preserves_all_codec_identity_states() {
         sanitize_context_for_response_codec(Some(&AnthropicMessagesCodec as &dyn LlmResponseCodec))
             .codec(),
         &LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::AnthropicMessages)
+    );
+    assert_eq!(
+        sanitize_context_for_response_codec(Some(&OCIGenAIChatCodec as &dyn LlmResponseCodec))
+            .codec(),
+        &LlmCodecIdentity::BuiltIn(BuiltinLlmCodec::OCIGenAI)
     );
     assert_eq!(
         sanitize_context_for_response_codec(Some(&RuntimeIdentityCodec)).codec(),
@@ -316,7 +337,7 @@ fn credential_headers_are_removed_before_request_sanitizers_and_event_emission()
     )
     .unwrap();
 
-    let provider_requests = Arc::new(Mutex::new(Vec::<LlmRequest>::new()));
+    let provider_requests = Arc::new(Mutex::new(Vec::<(String, LlmRequest)>::new()));
     let buffered_provider_requests = Arc::clone(&provider_requests);
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
@@ -325,7 +346,10 @@ fn credential_headers_are_removed_before_request_sanitizers_and_event_emission()
                 .name("credential-header-buffered")
                 .request(request.clone())
                 .func(Arc::new(move |request| {
-                    buffered_provider_requests.lock().unwrap().push(request);
+                    buffered_provider_requests
+                        .lock()
+                        .unwrap()
+                        .push(("credential-header-buffered".into(), request));
                     Box::pin(async { Ok(json!({"ok": true})) })
                 }))
                 .build(),
@@ -339,7 +363,10 @@ fn credential_headers_are_removed_before_request_sanitizers_and_event_emission()
                 .name("credential-header-streaming")
                 .request(request.clone())
                 .func(Arc::new(move |request| {
-                    streaming_provider_requests.lock().unwrap().push(request);
+                    streaming_provider_requests
+                        .lock()
+                        .unwrap()
+                        .push(("credential-header-streaming".into(), request));
                     Box::pin(async {
                         Ok(LlmJsonStream::new(tokio_stream::iter(vec![Ok(json!({
                             "chunk": true
@@ -382,18 +409,41 @@ fn credential_headers_are_removed_before_request_sanitizers_and_event_emission()
     .collect::<Vec<_>>();
     drop(events);
     assert_eq!(start_events.len(), 3);
-    for event in start_events {
+    for event in &start_events {
         let input: LlmRequest = serde_json::from_value(event.input().cloned().unwrap()).unwrap();
         assert_observable_credential_headers_are_removed(&input);
     }
 
     let provider_requests = provider_requests.lock().unwrap();
     assert_eq!(provider_requests.len(), 2);
-    assert!(
-        provider_requests
+    for (name, provider) in provider_requests.iter() {
+        assert_eq!(provider.content, request.content);
+        assert_eq!(
+            provider.headers.get("x-request-id"),
+            request.headers.get("x-request-id")
+        );
+        let traceparent_headers = provider
+            .headers
             .iter()
-            .all(|provider| provider == &request)
-    );
+            .filter(|(key, _)| key.eq_ignore_ascii_case("traceparent"))
+            .collect::<Vec<_>>();
+        assert_eq!(traceparent_headers.len(), 1);
+        assert_eq!(traceparent_headers[0].0, "traceparent");
+        let traceparent = traceparent_headers[0]
+            .1
+            .as_str()
+            .expect("managed LLM traceparent must be a string");
+        assert!(traceparent.starts_with("00-"));
+        assert!(traceparent.ends_with("-01"));
+        assert_eq!(traceparent.len(), 55);
+
+        let start = start_events
+            .iter()
+            .find(|event| event.name() == name)
+            .unwrap_or_else(|| panic!("missing LLM start event {name}"));
+        let event_uuid = start.uuid().simple().to_string();
+        assert_eq!(&traceparent[36..52], &event_uuid[16..]);
+    }
 
     assert!(deregister_llm_sanitize_request_guardrail("credential-header-redaction").unwrap());
     assert!(deregister_subscriber("credential-header-redaction").unwrap());
@@ -937,6 +987,79 @@ fn freshness_culls_annotations_and_repeated_compactions_are_idempotent() {
 }
 
 #[test]
+fn full_payload_policy_preserves_complete_repeated_request_history() {
+    let _guard = lock_global_runtime();
+    reset_global();
+    set_thread_scope_stack(create_scope_stack());
+    global_context()
+        .write()
+        .unwrap()
+        .observability_full_payloads_enabled = true;
+
+    let events = Arc::new(Mutex::new(Vec::<Event>::new()));
+    let captured = events.clone();
+    register_subscriber(
+        "full-payloads",
+        Arc::new(move |event| captured.lock().unwrap().push(event.clone())),
+    )
+    .unwrap();
+
+    let request = multi_turn_request();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        for name in ["full-payload-first", "full-payload-repeated"] {
+            llm_call_execute(
+                LlmCallExecuteParams::builder()
+                    .name(name)
+                    .request(request.clone())
+                    .func(Arc::new(|_| Box::pin(async { Ok(json!({"done": true})) })))
+                    .codec(Arc::new(OpenAIChatCodec))
+                    .build(),
+            )
+            .await
+            .unwrap();
+        }
+    });
+    llm_call(
+        LlmCallParams::builder()
+            .name("full-payload-manual")
+            .request(&request)
+            .annotated_request(multi_turn_annotation())
+            .build(),
+    )
+    .unwrap();
+
+    flush_subscribers().unwrap();
+    assert!(deregister_subscriber("full-payloads").unwrap());
+    global_context()
+        .write()
+        .unwrap()
+        .observability_full_payloads_enabled = false;
+
+    let events = events.lock().unwrap();
+    for name in [
+        "full-payload-first",
+        "full-payload-repeated",
+        "full-payload-manual",
+    ] {
+        let start = events
+            .iter()
+            .find(|event| {
+                event.name() == name && event.scope_category() == Some(ScopeCategory::Start)
+            })
+            .unwrap_or_else(|| panic!("missing LLM start event {name}"));
+        assert_eq!(
+            start.input().unwrap()["content"]["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(start.annotated_request().unwrap().messages.len(), 4);
+    }
+}
+
+#[test]
 fn request_projection_handles_history_edge_cases() {
     let project = |messages: Json| {
         let annotated: AnnotatedLlmRequest =
@@ -1173,8 +1296,8 @@ fn projection_encode_failures_do_not_block_managed_or_streaming_calls() {
         }
     });
 
-    assert_eq!(projection_attempts.load(Ordering::Relaxed), 2);
     flush_subscribers().unwrap();
+    assert_eq!(projection_attempts.load(Ordering::Relaxed), 2);
     assert!(deregister_subscriber("projection-encode-failure").unwrap());
     let events = events.lock().unwrap();
     for name in [
@@ -1718,6 +1841,7 @@ fn llm_call_execute_adds_otel_status_metadata_to_end_events() {
     let error_metadata = metadata_for("llm-error");
     assert_eq!(error_metadata["caller"], json!("llm-error"));
     assert_eq!(error_metadata["otel.status_code"], json!("ERROR"));
+    assert_eq!(error_metadata["error.type"], json!("internal_error"));
     assert!(
         error_metadata["otel.status_description"]
             .as_str()
@@ -1875,6 +1999,10 @@ fn llm_stream_call_execute_adds_otel_error_metadata_to_failed_end_events() {
         json!("llm-stream-upstream-error")
     );
     assert_eq!(upstream_error_metadata["otel.status_code"], json!("ERROR"));
+    assert_eq!(
+        upstream_error_metadata["error.type"],
+        json!("internal_error")
+    );
     assert!(
         upstream_error_metadata["otel.status_description"]
             .as_str()
@@ -1888,6 +2016,10 @@ fn llm_stream_call_execute_adds_otel_error_metadata_to_failed_end_events() {
         json!("llm-stream-collector-error")
     );
     assert_eq!(collector_error_metadata["otel.status_code"], json!("ERROR"));
+    assert_eq!(
+        collector_error_metadata["error.type"],
+        json!("internal_error")
+    );
     assert!(
         collector_error_metadata["otel.status_description"]
             .as_str()

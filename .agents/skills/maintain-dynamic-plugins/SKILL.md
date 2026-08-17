@@ -23,13 +23,25 @@ Use this skill for `plugin.kind = "rust_dynamic"`, `plugin.kind = "worker"`,
   plugins cross `grpc-v1`.
 - Do not pass Rust runtime types, trait objects, futures, or allocator-owned
   strings across the native dynamic-library boundary.
-- Keep worker protocol DTOs in `JsonEnvelope`; protobuf owns control flow, not
-  duplicated Relay data models.
+- Typed native middleware futures run on the SDK-owned Tokio executor. Keep
+  subscribers synchronous and preserve raw synchronous ABI registrations.
+- Define closed worker transport structures in protobuf when generated clients
+  must enforce their fields. Keep open application payloads lossless by using
+  `JsonValue` or `JsonEnvelope` rather than `google.protobuf.Value`.
 - Keep `relay-plugin.toml` dynamic records separate from generic runtime
   components. Enabled dynamic records may synthesize internal component specs;
   disabled records stay inspectable but unloaded.
-- Treat plugin Relay compatibility as normal SemVer. Use `>=0.5,<1.0` in
-  examples unless a plugin intentionally declares a narrower range.
+- Relay 0.8 establishes the native API 1 and `grpc-v1` canonical
+  `ToolExecutionResult` baseline. Require every dynamic plugin to rebuild and
+  declare a `compat.relay` range that excludes versions before 0.8. Recommend
+  `>=0.8.0,<1.0`; open-ended or narrower 0.8-or-newer ranges are valid.
+- Treat `compat.relay` as the plugin author's compatibility assertion, not
+  proof that an artifact was rebuilt. Do not add a legacy raw-result adapter.
+- Relay 0.8 retains the `grpc-v1` identifier and
+  `nemo.relay.worker.v1` package while changing the tool-result protobuf types;
+  every worker must regenerate its bindings and rebuild. Native ABI v4 remains
+  unchanged. After this baseline reset, future incompatible native JSON or
+  worker protobuf changes must bump `native_api` or `worker_protocol`.
 - Do not add tests under `src`; Rust tests belong in crate `tests/` trees and
   Python SDK tests belong under `python/tests`.
 - Native and worker plugins are trusted extensions. Document that native plugins
@@ -59,6 +71,7 @@ Use this skill for `plugin.kind = "rust_dynamic"`, `plugin.kind = "worker"`,
 ## Validation
 
 ```bash
+just build-test-plugin-fixtures
 cargo test -p nemo-relay-types
 cargo test -p nemo-relay-plugin
 cargo test -p nemo-relay-worker-proto
@@ -69,6 +82,11 @@ just test-rust
 just test-python
 just docs
 ```
+
+The canonical `just test-rust`, `just test-python`, and `just test-go` recipes
+prepare plugin fixtures automatically. Run `just build-test-plugin-fixtures`
+before raw focused native or worker plugin tests; fixture compilation must not
+happen inside an individual test case.
 
 For broad runtime or public API changes, run the full `validate-change` matrix.
 

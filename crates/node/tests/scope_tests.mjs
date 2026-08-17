@@ -3,11 +3,14 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { waitForSubscriberCallbacks } from './test_support.mjs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const lib = require('../index.js');
+const nodeDir = fileURLToPath(new URL('..', import.meta.url));
 
 const {
   getHandle,
@@ -25,6 +28,77 @@ const {
 
 const SCOPE_ATTR_PARALLEL = 0b01;
 const SCOPE_ATTR_RELOCATABLE = 0b10;
+
+function runSubscriberFailureChild({ callback, registration = 'global' }) {
+  const register = {
+    global: "registerSubscriber('bad', () => { " + callback + ' });',
+    scope: [
+      "globalThis.scope = pushScope('subscriber_failure_scope', ScopeType.Agent, null, null);",
+      "scopeRegisterSubscriber(scope.uuid, 'bad', () => { " + callback + ' });',
+    ].join('\n'),
+    plugin: [
+      "process.chdir(require('node:os').tmpdir());",
+      'globalThis.plugin = require(' + JSON.stringify(path.join(nodeDir, 'plugin.js')) + ');',
+      "globalThis.pluginKind = 'node.test.subscriber-failure';",
+      'plugin.register(pluginKind, {',
+      '  register(_config, context) {',
+      "    context.registerSubscriber('bad', () => { " + callback + ' });',
+      '  },',
+      '});',
+      "await plugin.initialize({ version: 1, components: [plugin.ComponentSpec('observability', { version: 3 }), plugin.ComponentSpec(pluginKind)] });",
+    ].join('\n'),
+  }[registration];
+  const scopeEvent = registration === 'scope' ? 'scope' : 'null';
+  const cleanup = {
+    global: "deregisterSubscriber('bad');",
+    scope: "scopeDeregisterSubscriber(scope.uuid, 'bad'); popScope(scope);",
+    plugin: 'plugin.clear(); plugin.deregister(pluginKind);',
+  }[registration];
+  const script = `
+    const lib = require(${JSON.stringify(path.join(nodeDir, 'index.js'))});
+    const {
+      ScopeType, clearLastCallbackError, deregisterSubscriber, event, flushSubscribers,
+      getLastCallbackError, pushScope, popScope, registerSubscriber,
+      scopeDeregisterSubscriber, scopeRegisterSubscriber,
+    } = lib;
+    (async () => {
+      clearLastCallbackError();
+      let healthyCalls = 0;
+      registerSubscriber('healthy', (event) => {
+        if (event.name === 'subscriber_failure_mark') healthyCalls += 1;
+      });
+      try {
+        ${register}
+        event('subscriber_failure_mark', ${scopeEvent}, null, null);
+        await flushSubscribers();
+        if (healthyCalls !== 1) throw new Error('healthy subscriber did not receive the event');
+        const error = getLastCallbackError() ?? '';
+        if (!/bad/.test(error) || !/subscriber boom/.test(error)) {
+          throw new Error('missing subscriber error: ' + error);
+        }
+        console.log('subscriber failure isolated');
+      } finally {
+        ${cleanup}
+        deregisterSubscriber('healthy');
+        clearLastCallbackError();
+      }
+    })().catch((error) => {
+      console.error(error);
+      process.exitCode = 1;
+    });
+  `;
+  let output;
+  try {
+    output = execFileSync(process.execPath, ['--eval', script], {
+      cwd: nodeDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    throw new Error(`subscriber failure child failed (${registration}):\n${error.stdout ?? ''}${error.stderr ?? ''}`);
+  }
+  assert.match(output, /subscriber failure isolated/);
+}
 
 function rejectWithPrimitive(value) {
   return Promise.reject(value);
@@ -98,7 +172,7 @@ describe('Scope operations', () => {
     try {
       const scope = pushScope('pop_metadata_scope', ScopeType.Agent, null, null, null, { a: 1, b: 2, c: 3 });
       popScope(scope, null, null, { c: 3.5, d: 4 });
-      await waitForSubscriberCallbacks(() => events.some((e) => e.name === 'pop_metadata_scope' && e.scope_category === 'end'));
+      await flushSubscribers();
 
       const end = events.find(
         (e) => e.name === 'pop_metadata_scope' && e.kind === 'scope' && e.scope_category === 'end',
@@ -150,7 +224,7 @@ describe('withScope', () => {
       toolResult = await toolCallExecute(
         'search',
         { query: 'hello' },
-        (args) => ({ echo: args.query }),
+        (args) => ({ result: { echo: args.query } }),
         handle,
         null,
         null,
@@ -168,7 +242,7 @@ describe('withScope', () => {
       );
       assert.equal(childParentUuid, handleUuid, 'child scope should record the handle as its parent');
     });
-    assert.deepEqual(toolResult, { echo: 'hello' });
+    assert.deepEqual(toolResult, { result: { echo: 'hello' } });
     assert.deepEqual(llmResult, { ok: true, messages: [{ role: 'user', content: 'hi' }] });
   });
 
@@ -202,7 +276,7 @@ describe('withScope', () => {
       await withScope('with_scope_ok_status', ScopeType.Function, () => ({ ok: true }), null, null, null, {
         caller: 'node',
       });
-      await waitForSubscriberCallbacks(() => events.some((e) => e.name === 'with_scope_ok_status' && e.scope_category === 'end'));
+      await flushSubscribers();
 
       const end = events.find(
         (e) => e.name === 'with_scope_ok_status' && e.kind === 'scope' && e.scope_category === 'end',
@@ -254,7 +328,7 @@ describe('withScope', () => {
           }),
         /node status failure/,
       );
-      await waitForSubscriberCallbacks(() => events.some((e) => e.name === 'with_scope_error_status' && e.scope_category === 'end'));
+      await flushSubscribers();
 
       const end = events.find(
         (e) => e.name === 'with_scope_error_status' && e.kind === 'scope' && e.scope_category === 'end',
@@ -349,7 +423,7 @@ describe('Subscribers', () => {
     try {
       const scope = pushScope('sub_test', ScopeType.Agent, null, null);
       popScope(scope);
-      await waitForSubscriberCallbacks(() => events.length > 0);
+      await flushSubscribers();
     } finally {
       deregisterSubscriber('node_event_collector');
     }
@@ -360,11 +434,90 @@ describe('Subscribers', () => {
     registerSubscriber('node_flush_collector', (e) => events.push(e));
     try {
       event('node_flush_mark', null, null, null);
-      await waitForSubscriberCallbacks(() => events.some((e) => e.kind === 'mark' && e.name === 'node_flush_mark'));
+      await flushSubscribers();
       assert.ok(events.some((e) => e.kind === 'mark' && e.name === 'node_flush_mark'));
     } finally {
       deregisterSubscriber('node_flush_collector');
     }
+  });
+
+  it('flushSubscribers waits for JavaScript callbacks without inspecting their return values', async () => {
+    let called = false;
+    registerSubscriber('node_flush_js_callback', () => {
+      called = true;
+      return 1n;
+    });
+    try {
+      event('node_flush_js_callback_mark', null, null, null);
+      await flushSubscribers();
+      assert.equal(called, true);
+    } finally {
+      deregisterSubscriber('node_flush_js_callback');
+    }
+  });
+
+  it('flushSubscribers waits for a fulfilled JavaScript subscriber promise', async () => {
+    let release;
+    let settled = false;
+    let flushed = false;
+    const deferred = new Promise((resolve) => {
+      release = resolve;
+    });
+    registerSubscriber('node_flush_js_promise_callback', async () => {
+      await deferred;
+      settled = true;
+    });
+    try {
+      event('node_flush_js_promise_callback_mark', null, null, null);
+      const flushing = flushSubscribers().then(() => {
+        flushed = true;
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(flushed, false);
+      release();
+      await flushing;
+      assert.equal(settled, true);
+    } finally {
+      deregisterSubscriber('node_flush_js_promise_callback');
+    }
+  });
+
+  it('flushSubscribers settles after a subscriber callback failure', async () => {
+    registerSubscriber('node_flush_js_failure', () => {
+      throw new Error('flush failure');
+    });
+    try {
+      event('node_flush_js_failure_mark', null, null, null);
+      await flushSubscribers();
+    } finally {
+      deregisterSubscriber('node_flush_js_failure');
+    }
+  });
+
+  it('isolates a synchronous global subscriber throw', () => {
+    runSubscriberFailureChild({
+      callback: "throw new Error('sync subscriber boom');",
+    });
+  });
+
+  it('isolates a rejected global subscriber promise', () => {
+    runSubscriberFailureChild({
+      callback: "return Promise.reject(new Error('async subscriber boom'));",
+    });
+  });
+
+  it('uses the safe adapter for scope-local subscribers', () => {
+    runSubscriberFailureChild({
+      registration: 'scope',
+      callback: "throw new Error('scope subscriber boom');",
+    });
+  });
+
+  it('uses the safe adapter for plugin subscribers', () => {
+    runSubscriberFailureChild({
+      registration: 'plugin',
+      callback: "return Promise.reject(new Error('plugin subscriber boom'));",
+    });
   });
 
   it('subscriber event properties', async () => {
@@ -375,7 +528,7 @@ describe('Subscribers', () => {
     try {
       const scope = pushScope('prop_test', ScopeType.Function, null, null);
       popScope(scope);
-      await waitForSubscriberCallbacks(() => captured !== null);
+      await flushSubscribers();
       assert.ok(captured, 'Expected an event');
       assert.ok(typeof captured.uuid === 'string');
       assert.ok(typeof captured.timestamp === 'string');
@@ -398,7 +551,7 @@ describe('Subscribers', () => {
         },
         null,
       );
-      await waitForSubscriberCallbacks(() => events.some((e) => e.kind === 'mark'));
+      await flushSubscribers();
       const found = events.some((e) => e.kind === 'mark');
       assert.ok(found, 'Expected a Mark event');
     } finally {

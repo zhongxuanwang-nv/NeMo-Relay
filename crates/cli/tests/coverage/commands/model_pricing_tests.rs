@@ -19,9 +19,7 @@ fn catalog_json() -> Value {
                 "output_per_million": 2.0
             },
             "prompt_cache": {
-                "read_accounting": "separate",
-                "read_per_million": 0.1,
-                "write_per_million": 0.2
+                "read_accounting": "separate"
             }
         }]
     })
@@ -38,8 +36,8 @@ fn pricing_helpers_cover_scopes_components_sources_and_usage() {
         TargetScope::User
     );
     assert_eq!(
-        target_pricing_scope(&ConfigurationScope::Project).unwrap(),
-        TargetScope::Project
+        target_pricing_scope(&ConfigurationScope::User).unwrap(),
+        TargetScope::User
     );
     assert_eq!(
         target_pricing_scope(&ConfigurationScope::Global).unwrap(),

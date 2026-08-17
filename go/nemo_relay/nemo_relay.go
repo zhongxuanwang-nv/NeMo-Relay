@@ -46,6 +46,8 @@ typedef struct NemoRelayLlmSanitizeResponseContext { uint32_t codec_kind; const 
 typedef void (*NemoRelayFreeFn)(void* user_data);
 
 // Core API
+extern int32_t nemo_relay_initialize_default_logging(void);
+extern int32_t nemo_relay_shutdown_default_logging(void);
 extern int32_t nemo_relay_get_handle(FfiScopeHandle** out);
 extern int32_t nemo_relay_push_scope(const char* name, int32_t scope_type, const FfiScopeHandle* parent, uint32_t attributes, const char* data_json, const char* metadata_json, const char* input_json, const int64_t* timestamp_unix_micros, FfiScopeHandle** out);
 extern int32_t nemo_relay_pop_scope(const FfiScopeHandle* handle, const char* output_json, const char* metadata_json, const int64_t* timestamp_unix_micros);
@@ -114,6 +116,7 @@ extern int32_t nemo_relay_llm_stream_call_execute(
 extern FfiCodecHandle* nemo_relay_openai_chat_codec_new(void);
 extern FfiCodecHandle* nemo_relay_openai_responses_codec_new(void);
 extern FfiCodecHandle* nemo_relay_anthropic_messages_codec_new(void);
+extern FfiCodecHandle* nemo_relay_gemini_generate_content_codec_new(void);
 extern void nemo_relay_codec_free(FfiCodecHandle* handle);
 
 extern void nemo_relay_set_last_error_message(const char* msg);
@@ -231,6 +234,8 @@ extern void nemo_relay_string_free(char* ptr);
 extern int32_t nemo_relay_scope_stack_create(FfiScopeStack** out);
 extern int32_t nemo_relay_capture_propagation_context_json(char** out);
 extern int32_t nemo_relay_capture_propagation_context_with_root_json(const char* root_uuid, char** out);
+extern int32_t nemo_relay_capture_traceparent(char** out);
+extern int32_t nemo_relay_propagation_context_to_traceparent(const char* context_json, char** out);
 extern int32_t nemo_relay_scope_stack_create_from_propagation_json(const char* context_json, FfiScopeStack** out);
 extern int32_t nemo_relay_scope_stack_set_thread(const FfiScopeStack* stack);
 extern int32_t nemo_relay_scope_stack_capture_thread(FfiThreadScopeStackBinding** out);
@@ -297,6 +302,18 @@ import (
 )
 
 const defaultServiceName = "nemo-relay"
+
+func init() {
+	if err := checkStatus(C.nemo_relay_initialize_default_logging()); err != nil {
+		panic(fmt.Sprintf("failed to initialize NeMo Relay operational logging: %v", err))
+	}
+}
+
+// ShutdownLogging drains pending operational log records and releases the default logging runtime.
+// Callers that configure file sinks should defer ShutdownLogging from main.
+func ShutdownLogging() error {
+	return checkStatus(C.nemo_relay_shutdown_default_logging())
+}
 
 func checkedValue[T any](status int32, value T) (T, error) {
 	if err := checkStatus(C.int32_t(status)); err != nil {
@@ -680,7 +697,8 @@ func WithToolAttributes(attrs uint32) ToolCallOption {
 
 // WithToolData stores an arbitrary JSON application data payload on the manual
 // tool handle. Manual Start event data is the sanitized tool arguments; manual
-// End event data is the sanitized result unless that value is JSON null.
+// End event data is the sanitized protocol result unless that value is JSON
+// null.
 func WithToolData(data json.RawMessage) ToolCallOption {
 	return func(o *toolCallOptions) {
 		o.data = C.CString(string(data))
@@ -761,19 +779,25 @@ func ToolCall(name string, args json.RawMessage, opts ...ToolCallOption) (*ToolH
 }
 
 // ToolCallEnd completes a tool call that was previously started with [ToolCall].
-// It emits an End event to all subscribers with the provided result JSON. The
-// handle must have been returned by a prior [ToolCall] invocation. The emitted
-// End event records result after sanitize-response guardrails; [WithToolData]
-// is used only when the sanitized result is JSON null. Response intercepts run
-// only through [ToolCallExecute].
-func ToolCallEnd(handle *ToolHandle, result json.RawMessage, opts ...ToolCallOption) error {
+// It emits an End event to all subscribers with the provided canonical result.
+// The handle must have been returned by a prior [ToolCall] invocation. The emitted
+// End event records Result after sanitize-response guardrails and carries
+// Annotation in the event category profile; [WithToolData] is used only when
+// the sanitized result is JSON null. Response intercepts run only through
+// [ToolCallExecute].
+func ToolCallEnd(handle *ToolHandle, result ToolExecutionResult, opts ...ToolCallOption) error {
 	o := &toolCallOptions{}
 	for _, opt := range opts {
 		opt(o)
 	}
 	defer freeToolOpts(o)
 
-	cResult := C.CString(string(result))
+	result = normalizeToolExecutionResult(result)
+	resultJSON, err := jsonMarshal(result)
+	if err != nil {
+		return err
+	}
+	cResult := C.CString(string(resultJSON))
 	defer C.free(unsafe.Pointer(cResult))
 
 	return checkStatus(C.nemo_relay_tool_call_end(handle.ptr, cResult, o.data, o.metadata, o.timestamp))
@@ -788,7 +812,7 @@ func ToolCallEnd(handle *ToolHandle, result json.RawMessage, opts ...ToolCallOpt
 // and GuardrailRejected is returned. This is the recommended high-level API
 // for tool invocations. Sanitize guardrails do not rewrite the value passed
 // into fn or the value returned to the caller.
-func ToolCallExecute(name string, args json.RawMessage, fn ToolExecutionFunc, opts ...ToolCallOption) (json.RawMessage, error) {
+func ToolCallExecute(name string, args json.RawMessage, fn ToolExecutionFunc, opts ...ToolCallOption) (ToolExecutionResult, error) {
 	o := &toolCallOptions{}
 	for _, opt := range opts {
 		opt(o)
@@ -813,9 +837,13 @@ func ToolCallExecute(name string, args json.RawMessage, fn ToolExecutionFunc, op
 		&out,
 	)
 	if err := checkStatus(status); err != nil {
-		return nil, err
+		return ToolExecutionResult{}, err
 	}
-	result := json.RawMessage(C.GoString(out))
+	result, err := decodeToolExecutionResult([]byte(C.GoString(out)))
+	if err != nil {
+		C.nemo_relay_string_free(out)
+		return ToolExecutionResult{}, err
+	}
 	C.nemo_relay_string_free(out)
 	return result, nil
 }
@@ -908,9 +936,9 @@ func WithLLMCodec(codec CodecFunc) LLMCallOption {
 
 // CodecHandle wraps an opaque FFI codec handle that carries both request
 // codec (decode/encode) and response codec (decode_response) implementations.
-// Create via [NewOpenAIChatCodec], [NewOpenAIResponsesCodec], or
-// [NewAnthropicMessagesCodec]. The handle is automatically freed when
-// garbage collected.
+// Create via [NewOpenAIChatCodec], [NewOpenAIResponsesCodec],
+// [NewAnthropicMessagesCodec], or [NewGeminiGenerateContentCodec]. The handle is
+// automatically freed when garbage collected.
 type CodecHandle struct {
 	ptr *C.FfiCodecHandle
 }
@@ -963,9 +991,25 @@ func NewAnthropicMessagesCodec() *CodecHandle {
 	return h
 }
 
+// NewGeminiGenerateContentCodec creates a codec for the Gemini generateContent API.
+//
+// The returned handle can be passed to [WithLLMCodec] or
+// [WithLLMResponseCodec] to enable structured request and response handling for
+// Gemini generateContent payloads.
+func NewGeminiGenerateContentCodec() *CodecHandle {
+	h := &CodecHandle{ptr: C.nemo_relay_gemini_generate_content_codec_new()}
+	runtime.SetFinalizer(h, func(h *CodecHandle) {
+		if h.ptr != nil {
+			C.nemo_relay_codec_free(h.ptr)
+			h.ptr = nil
+		}
+	})
+	return h
+}
+
 // WithLLMResponseCodec sets the response codec for this LLM call.
-// Pass a CodecHandle created by [NewOpenAIChatCodec],
-// [NewOpenAIResponsesCodec], or [NewAnthropicMessagesCodec].
+// Pass a CodecHandle created by [NewOpenAIChatCodec], [NewOpenAIResponsesCodec],
+// [NewAnthropicMessagesCodec], or [NewGeminiGenerateContentCodec].
 // The codec handle is kept alive for the duration of the FFI call via
 // runtime.KeepAlive, so it is safe to pass an inline-constructed handle.
 func WithLLMResponseCodec(codec *CodecHandle) LLMCallOption {
@@ -1580,6 +1624,22 @@ func (context PropagationContext) ToJSON() (string, error) {
 	return string(payload), nil
 }
 
+// ToTraceparent converts a rooted propagation context to a W3C traceparent value.
+func (context PropagationContext) ToTraceparent() (string, error) {
+	payload, err := context.ToJSON()
+	if err != nil {
+		return "", err
+	}
+	cPayload := C.CString(payload)
+	defer C.free(unsafe.Pointer(cPayload))
+	var out *C.char
+	if err := checkStatus(C.nemo_relay_propagation_context_to_traceparent(cPayload, &out)); err != nil {
+		return "", err
+	}
+	defer C.nemo_relay_string_free(out)
+	return C.GoString(out), nil
+}
+
 // PropagationContextFromJSON deserializes and validates a transport context.
 func PropagationContextFromJSON(value string) (PropagationContext, error) {
 	var context PropagationContext
@@ -1625,6 +1685,16 @@ func CapturePropagationContextWithRoot(rootUUID *string) (PropagationContext, er
 	}
 	defer C.nemo_relay_string_free(out)
 	return PropagationContextFromJSON(C.GoString(out))
+}
+
+// CaptureTraceparent captures the current Relay context as a W3C traceparent value.
+func CaptureTraceparent() (string, error) {
+	var out *C.char
+	if err := checkStatus(C.nemo_relay_capture_traceparent(&out)); err != nil {
+		return "", err
+	}
+	defer C.nemo_relay_string_free(out)
+	return C.GoString(out), nil
 }
 
 // NewScopeStack creates a new isolated scope stack.
@@ -2010,16 +2080,15 @@ type OpenTelemetrySubscriber struct {
 	ptr unsafe.Pointer
 }
 
-// NewOpenTelemetrySubscriber creates a new OpenTelemetry subscriber from config.
-func NewOpenTelemetrySubscriber(config OpenTelemetryConfig) (*OpenTelemetrySubscriber, error) {
+func normalizeOpenTelemetryConfig(config OpenTelemetryConfig) (OpenTelemetryConfig, error) {
 	if config.Transport == "" {
 		config.Transport = OpenTelemetryTransportHTTPBinary
 	}
 	if config.Type == "" {
-		return nil, fmt.Errorf("type is required")
+		return config, fmt.Errorf("type is required")
 	}
 	if config.Endpoint == "" {
-		return nil, fmt.Errorf("endpoint is required")
+		return config, fmt.Errorf("endpoint is required")
 	}
 	if config.ServiceName == "" {
 		config.ServiceName = "unknown_service"
@@ -2045,17 +2114,30 @@ func NewOpenTelemetrySubscriber(config OpenTelemetryConfig) (*OpenTelemetrySubsc
 	if config.AttributeMappings == nil {
 		config.AttributeMappings = []OtlpAttributeMapping{}
 	}
+	return config, nil
+}
+
+func optionalCString(value string) *C.char {
+	if value == "" {
+		return nil
+	}
+	return C.CString(value)
+}
+
+// NewOpenTelemetrySubscriber creates a new OpenTelemetry subscriber from config.
+func NewOpenTelemetrySubscriber(config OpenTelemetryConfig) (*OpenTelemetrySubscriber, error) {
+	config, err := normalizeOpenTelemetryConfig(config)
+	if err != nil {
+		return nil, err
+	}
 
 	cTransport := C.CString(string(config.Transport))
 	defer C.free(unsafe.Pointer(cTransport))
 	cType := C.CString(string(config.Type))
 	defer C.free(unsafe.Pointer(cType))
 
-	var cEndpoint *C.char
-	if config.Endpoint != "" {
-		cEndpoint = C.CString(config.Endpoint)
-		defer C.free(unsafe.Pointer(cEndpoint))
-	}
+	cEndpoint := C.CString(config.Endpoint)
+	defer C.free(unsafe.Pointer(cEndpoint))
 
 	headersJSON, err := jsonMarshal(config.Headers)
 	if err != nil {
@@ -2074,17 +2156,11 @@ func NewOpenTelemetrySubscriber(config OpenTelemetryConfig) (*OpenTelemetrySubsc
 	cServiceName := C.CString(config.ServiceName)
 	defer C.free(unsafe.Pointer(cServiceName))
 
-	var cServiceNamespace *C.char
-	if config.ServiceNamespace != "" {
-		cServiceNamespace = C.CString(config.ServiceNamespace)
-		defer C.free(unsafe.Pointer(cServiceNamespace))
-	}
+	cServiceNamespace := optionalCString(config.ServiceNamespace)
+	defer C.free(unsafe.Pointer(cServiceNamespace))
 
-	var cServiceVersion *C.char
-	if config.ServiceVersion != "" {
-		cServiceVersion = C.CString(config.ServiceVersion)
-		defer C.free(unsafe.Pointer(cServiceVersion))
-	}
+	cServiceVersion := optionalCString(config.ServiceVersion)
+	defer C.free(unsafe.Pointer(cServiceVersion))
 
 	cInstrumentationScope := C.CString(config.InstrumentationScope)
 	defer C.free(unsafe.Pointer(cInstrumentationScope))

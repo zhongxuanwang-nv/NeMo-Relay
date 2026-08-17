@@ -31,6 +31,111 @@ use crate::plugins::policy::{
 };
 
 #[test]
+fn transparent_gateway_fingerprints_are_stable_and_url_scoped() {
+    let first = transparent_gateway_fingerprint("http://127.0.0.1:47632");
+    assert_eq!(
+        first,
+        transparent_gateway_fingerprint("http://127.0.0.1:47632")
+    );
+    assert_ne!(
+        first,
+        transparent_gateway_fingerprint("http://127.0.0.1:47633")
+    );
+    assert_eq!(
+        first,
+        "transparent-sha256:bb0bbeaad4270d196ff14af97fc00e330c9d1385224b0b26dfbba9e626c44717"
+    );
+    assert!(first.starts_with("transparent-sha256:"));
+}
+
+#[test]
+fn configuration_json_and_header_helpers_retain_only_valid_values() {
+    assert_eq!(
+        parse_json_option("metadata", r#"{"enabled":true}"#).unwrap(),
+        json!({"enabled": true})
+    );
+    assert!(
+        parse_json_option("metadata", "{")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid metadata")
+    );
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-value", http::HeaderValue::from_static("text"));
+    headers.insert("x-json", http::HeaderValue::from_static(r#"{"ok":true}"#));
+    headers.insert("x-empty", http::HeaderValue::from_static(""));
+    assert_eq!(header_string(&headers, "x-value").as_deref(), Some("text"));
+    assert_eq!(header_string(&headers, "x-empty"), None);
+    assert_eq!(header_string(&headers, "missing"), None);
+    assert_eq!(header_json(&headers, "x-json"), Some(json!({"ok": true})));
+    assert_eq!(header_json(&headers, "x-value"), None);
+}
+
+#[test]
+fn configuration_legacy_observability_detection_reports_each_supported_section() {
+    assert!(legacy_observability_sections(&toml::Value::Table(toml::Table::new())).is_empty());
+    let value = toml::from_str(
+        r#"
+[exporters]
+[observability]
+[export.openinference]
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        legacy_observability_sections(&value),
+        vec!["[exporters]", "[observability]", "[export.openinference]"]
+    );
+}
+
+#[test]
+fn bounded_dynamic_manifest_loader_accepts_directories_and_rejects_invalid_utf8() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = dir.path().join(DYNAMIC_PLUGIN_MANIFEST_FILENAME);
+    std::fs::write(
+        &manifest_path,
+        r#"
+manifest_version = 1
+
+[plugin]
+id = "acme.coverage-worker"
+kind = "worker"
+
+[compat]
+relay = ">=0.8.0,<1.0"
+worker_protocol = "grpc-v1"
+
+[defaults]
+enabled = false
+
+[capabilities]
+items = ["plugin_worker"]
+
+[load]
+runtime = "python"
+entrypoint = "plugin:register"
+"#,
+    )
+    .unwrap();
+    let (manifest, normalized, bytes) =
+        load_bounded_dynamic_plugin_manifest_bytes(dir.path()).unwrap();
+    assert_eq!(manifest.plugin.id, "acme.coverage-worker");
+    assert!(normalized.ends_with(DYNAMIC_PLUGIN_MANIFEST_FILENAME));
+    assert!(!bytes.is_empty());
+    assert!(load_bounded_dynamic_plugin_manifest(dir.path()).is_ok());
+
+    let invalid = dir.path().join("invalid.toml");
+    std::fs::write(&invalid, [0xff_u8]).unwrap();
+    assert!(
+        load_bounded_dynamic_plugin_manifest_bytes(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("not UTF-8")
+    );
+}
+
+#[test]
 fn explicit_plugin_config_path_resolves_runtime_target() {
     let config = PathBuf::from("/managed/config.toml");
     let sibling = PathBuf::from("/managed/plugins.toml");
@@ -48,7 +153,7 @@ fn explicit_plugin_config_path_resolves_runtime_target() {
 }
 
 #[test]
-fn config_paths_layer_explicit_or_user_then_project_then_system() {
+fn config_paths_layer_explicit_or_user_then_system_and_ignore_project() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     let child = project.join("nested");
@@ -59,41 +164,25 @@ fn config_paths_layer_explicit_or_user_then_project_then_system() {
     std::fs::create_dir_all(project_config.parent().unwrap()).unwrap();
     std::fs::write(&project_config, "").unwrap();
     let _scope = PluginConfigDiscoveryScope::enter(&child, &xdg);
-    let discovered_project_config = std::env::current_dir()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(".nemo-relay")
-        .join("config.toml");
-    let system_config = PathBuf::from("/etc/nemo-relay/config.toml");
+    let system_config = system_config_dir().join("config.toml");
 
     assert_eq!(
-        config_paths_scoped(None, false),
+        config_paths(None),
         vec![
             xdg.join("nemo-relay").join("config.toml"),
-            discovered_project_config.clone(),
             system_config.clone(),
         ]
     );
 
     let explicit_config = temp.path().join("managed").join("config.toml");
     assert_eq!(
-        config_paths_scoped(Some(&explicit_config), false),
-        vec![
-            explicit_config.clone(),
-            discovered_project_config,
-            system_config.clone(),
-        ]
-    );
-    assert_eq!(
-        config_paths_scoped(Some(&explicit_config), true),
-        vec![explicit_config, system_config],
-        "user-only mode suppresses project discovery but retains the system layer"
+        config_paths(Some(&explicit_config)),
+        vec![explicit_config, system_config]
     );
 }
 
 #[test]
-fn plugin_config_paths_layer_explicit_or_user_then_project_then_system() {
+fn plugin_config_paths_layer_explicit_or_user_then_system_and_ignore_project() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     let child = project.join("nested");
@@ -104,19 +193,12 @@ fn plugin_config_paths_layer_explicit_or_user_then_project_then_system() {
     std::fs::create_dir_all(project_plugins.parent().unwrap()).unwrap();
     std::fs::write(&project_plugins, "version = 1\n").unwrap();
     let _scope = PluginConfigDiscoveryScope::enter(&child, &xdg);
-    let discovered_project_plugins = std::env::current_dir()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(".nemo-relay")
-        .join("plugins.toml");
-    let system_plugins = PathBuf::from("/etc/nemo-relay/plugins.toml");
+    let system_plugins = system_config_dir().join("plugins.toml");
 
     assert_eq!(
-        plugin_config_paths_scoped(None, None, false),
+        plugin_config_paths(None, None),
         vec![
             xdg.join("nemo-relay").join("plugins.toml"),
-            discovered_project_plugins.clone(),
             system_plugins.clone(),
         ]
     );
@@ -124,27 +206,14 @@ fn plugin_config_paths_layer_explicit_or_user_then_project_then_system() {
     let explicit_config = temp.path().join("managed").join("config.toml");
     let explicit_plugins = explicit_config.parent().unwrap().join("plugins.toml");
     assert_eq!(
-        plugin_config_paths_scoped(Some(&explicit_config), None, false),
-        vec![
-            explicit_plugins.clone(),
-            discovered_project_plugins.clone(),
-            system_plugins.clone(),
-        ]
+        plugin_config_paths(Some(&explicit_config), None),
+        vec![explicit_plugins.clone(), system_plugins.clone()]
     );
 
     let override_plugins = temp.path().join("override").join("plugins.toml");
     assert_eq!(
-        plugin_config_paths_scoped(Some(&explicit_config), Some(&override_plugins), false),
-        vec![
-            override_plugins.clone(),
-            discovered_project_plugins,
-            system_plugins.clone(),
-        ]
-    );
-    assert_eq!(
-        plugin_config_paths_scoped(Some(&explicit_config), None, true),
-        vec![explicit_plugins, system_plugins],
-        "user-only mode suppresses project discovery but retains the system layer"
+        plugin_config_paths(Some(&explicit_config), Some(&override_plugins)),
+        vec![override_plugins, system_plugins]
     );
 }
 
@@ -153,7 +222,6 @@ struct PluginConfigDiscoveryScope {
     _guard: MutexGuard<'static, ()>,
     previous_cwd: PathBuf,
     previous_xdg_config_home: Option<OsString>,
-    previous_config_scope: Option<OsString>,
     previous_openai_api_key: Option<OsString>,
     previous_openai_base_url: Option<OsString>,
     previous_openai_auth_header: Option<OsString>,
@@ -171,7 +239,6 @@ impl PluginConfigDiscoveryScope {
             .unwrap_or_else(|error| error.into_inner());
         let previous_cwd = std::env::current_dir().unwrap();
         let previous_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
-        let previous_config_scope = std::env::var_os("NEMO_RELAY_CONFIG_SCOPE");
         let previous_openai_api_key = std::env::var_os("OPENAI_API_KEY");
         let previous_openai_base_url = std::env::var_os("NEMO_RELAY_OPENAI_BASE_URL");
         let previous_openai_auth_header = std::env::var_os("NEMO_RELAY_OPENAI_AUTH_HEADER");
@@ -181,7 +248,6 @@ impl PluginConfigDiscoveryScope {
         let previous_plugin_idle_timeout = std::env::var_os(PLUGIN_IDLE_TIMEOUT_ENV);
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", xdg_config_home);
-            std::env::remove_var("NEMO_RELAY_CONFIG_SCOPE");
             std::env::remove_var("OPENAI_API_KEY");
             std::env::remove_var("NEMO_RELAY_OPENAI_BASE_URL");
             std::env::remove_var("NEMO_RELAY_OPENAI_AUTH_HEADER");
@@ -196,7 +262,6 @@ impl PluginConfigDiscoveryScope {
             _guard: guard,
             previous_cwd,
             previous_xdg_config_home,
-            previous_config_scope,
             previous_openai_api_key,
             previous_openai_base_url,
             previous_openai_auth_header,
@@ -204,13 +269,6 @@ impl PluginConfigDiscoveryScope {
             previous_anthropic_auth_header,
             previous_bootstrap_fingerprint,
             previous_plugin_idle_timeout,
-        }
-    }
-
-    fn enable_user_scope(&self) {
-        // SAFETY: This scope holds the process-wide environment mutex.
-        unsafe {
-            std::env::set_var("NEMO_RELAY_CONFIG_SCOPE", "user");
         }
     }
 
@@ -245,10 +303,6 @@ impl Drop for PluginConfigDiscoveryScope {
             match self.previous_xdg_config_home.take() {
                 Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-            match self.previous_config_scope.take() {
-                Some(value) => std::env::set_var("NEMO_RELAY_CONFIG_SCOPE", value),
-                None => std::env::remove_var("NEMO_RELAY_CONFIG_SCOPE"),
             }
             match self.previous_openai_api_key.take() {
                 Some(value) => std::env::set_var("OPENAI_API_KEY", value),
@@ -347,7 +401,7 @@ fn effective_plugin_toml_sources_reports_empty_and_sorted_contributors() {
         .map(|path| path.canonicalize().unwrap())
         .collect::<Vec<_>>();
     actual.sort();
-    let mut expected = [project_plugins, user_plugins]
+    let mut expected = [user_plugins]
         .iter()
         .map(|path| path.canonicalize().unwrap())
         .collect::<Vec<_>>();
@@ -356,7 +410,7 @@ fn effective_plugin_toml_sources_reports_empty_and_sorted_contributors() {
 }
 
 #[test]
-fn effective_plugin_toml_sources_replace_user_with_explicit_and_include_project() {
+fn effective_plugin_toml_sources_replace_user_with_explicit_and_ignore_project() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     let xdg = temp.path().join("xdg");
@@ -365,11 +419,6 @@ fn effective_plugin_toml_sources_replace_user_with_explicit_and_include_project(
     std::fs::create_dir_all(&xdg).unwrap();
     std::fs::create_dir_all(&explicit_dir).unwrap();
     let _scope = PluginConfigDiscoveryScope::enter(&project, &xdg);
-    let discovered_project_plugins = std::env::current_dir()
-        .unwrap()
-        .join(".nemo-relay")
-        .join("plugins.toml");
-
     let explicit_config = explicit_dir.join("config.toml");
     let explicit_plugins = explicit_dir.join("plugins.toml");
     std::fs::write(&explicit_config, "").unwrap();
@@ -381,11 +430,9 @@ fn effective_plugin_toml_sources_replace_user_with_explicit_and_include_project(
     std::fs::create_dir_all(user_plugins.parent().unwrap()).unwrap();
     std::fs::write(&user_plugins, "components = [\n").unwrap();
 
-    let mut expected = vec![explicit_plugins, discovered_project_plugins];
-    expected.sort();
     assert_eq!(
         effective_plugin_toml_sources_without_system(Some(&explicit_config), None).unwrap(),
-        expected
+        vec![explicit_plugins]
     );
 }
 
@@ -459,7 +506,7 @@ id = "{plugin_id}"
 kind = "worker"
 
 [compat]
-relay = "0.1"
+relay = ">=0.8.0,<1.0"
 worker_protocol = "grpc-v1"
 
 [defaults]
@@ -602,7 +649,6 @@ fn session_config_uses_defaults_and_ignores_bad_json() {
 fn agent_and_gateway_mode_arguments_are_stable() {
     assert_eq!(CodingAgent::ClaudeCode.hook_path(), "/hooks/claude-code");
     assert_eq!(CodingAgent::Codex.hook_path(), "/hooks/codex");
-    assert_eq!(CodingAgent::Hermes.hook_path(), "/hooks/hermes");
     assert_eq!(GatewayMode::HookOnly.as_arg(), "hook-only");
     assert_eq!(GatewayMode::Passthrough.as_arg(), "passthrough");
     assert_eq!(GatewayMode::Required.as_arg(), "required");
@@ -616,7 +662,7 @@ fn agent_inference_uses_executable_basename() {
     );
     assert_eq!(CodingAgent::infer("codex"), Some(CodingAgent::Codex));
     assert_eq!(CodingAgent::infer("cursor-agent"), None);
-    assert_eq!(CodingAgent::infer("hermes"), Some(CodingAgent::Hermes));
+    assert_eq!(CodingAgent::infer("hermes"), None);
     assert_eq!(CodingAgent::infer("wrapper"), None);
 }
 
@@ -645,8 +691,6 @@ command = "claude"
 [agents.codex]
 command = "codex --approval-mode never"
 
-[agents.hermes]
-command = "hermes --yolo chat"
 "#,
     )
     .unwrap();
@@ -683,10 +727,21 @@ command = "hermes --yolo chat"
         resolved.agents.codex.command.as_deref(),
         Some("codex --approval-mode never")
     );
-    assert_eq!(
-        resolved.agents.hermes.command.as_deref(),
-        Some("hermes --yolo chat")
-    );
+}
+
+#[test]
+fn stale_hermes_agent_config_is_rejected() {
+    let value = toml::from_str::<toml::Value>(
+        r#"
+[agents.hermes]
+command = "hermes"
+"#,
+    )
+    .unwrap();
+
+    let error = validate_shared_config_shape(value).unwrap_err().to_string();
+
+    assert!(error.contains("unknown field `hermes`"));
 }
 
 #[test]
@@ -724,7 +779,7 @@ anthropic_auth_header = "Basic anthropic-file"
 }
 
 #[test]
-fn endpoint_overrides_clear_inherited_provider_auth_headers() {
+fn ignored_project_endpoints_do_not_clear_user_provider_auth_headers() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     let nested = project.join("nested");
@@ -756,13 +811,16 @@ anthropic_auth_header = "Basic user-anthropic"
 
     let resolved = resolve_server_config(&GatewayOverrides::default()).unwrap();
 
-    assert_eq!(resolved.gateway.openai_base_url, "http://project-openai");
-    assert!(resolved.gateway.openai_auth_header.is_none());
+    assert_eq!(resolved.gateway.openai_base_url, "http://user-openai");
     assert_eq!(
-        resolved.gateway.anthropic_base_url,
-        "http://project-anthropic"
+        resolved.gateway.openai_auth_header.as_deref(),
+        Some("Bearer user-openai")
     );
-    assert!(resolved.gateway.anthropic_auth_header.is_none());
+    assert_eq!(resolved.gateway.anthropic_base_url, "http://user-anthropic");
+    assert_eq!(
+        resolved.gateway.anthropic_auth_header.as_deref(),
+        Some("Basic user-anthropic")
+    );
 }
 
 #[test]
@@ -1153,7 +1211,7 @@ fn plugins_toml_path_resolution_tracks_config_scope() {
         plugin_config_paths(Some(&explicit), None),
         vec![
             temp.path().join("plugins.toml"),
-            PathBuf::from("/etc/nemo-relay/plugins.toml"),
+            system_config_dir().join("plugins.toml"),
         ]
     );
 
@@ -1165,31 +1223,21 @@ fn plugins_toml_path_resolution_tracks_config_scope() {
     std::fs::write(&plugin_path, "version = 1").unwrap();
     let user_config = temp.path().join("xdg/nemo-relay");
 
-    assert_eq!(find_project_plugin_config(&nested), Some(plugin_path));
     assert_eq!(
-        project_plugin_config_path(&nested),
-        project.join(".nemo-relay/plugins.toml")
-    );
-    assert_eq!(
-        implicit_plugin_config_paths(Some(&nested), Some(user_config.clone())),
+        implicit_plugin_config_paths(Some(user_config.clone())),
         vec![
             user_config.join("plugins.toml"),
-            project.join(".nemo-relay/plugins.toml"),
-            PathBuf::from("/etc/nemo-relay/plugins.toml"),
+            system_config_dir().join("plugins.toml"),
         ]
     );
-
-    std::fs::remove_file(project.join(".nemo-relay/plugins.toml")).unwrap();
-    std::fs::write(project.join(".nemo-relay/config.toml"), "").unwrap();
-    assert_eq!(find_project_plugin_config(&nested), None);
-    assert_eq!(
-        project_plugin_config_path(&nested),
-        project.join(".nemo-relay/plugins.toml")
+    assert!(
+        plugin_path.exists(),
+        "project file remains present but ignored"
     );
 }
 
 #[test]
-fn persistent_user_scope_excludes_project_gateway_and_plugin_layers() {
+fn all_runtime_scopes_exclude_project_gateway_and_plugin_layers() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("workspace");
     let nested = project.join("nested");
@@ -1198,27 +1246,26 @@ fn persistent_user_scope_excludes_project_gateway_and_plugin_layers() {
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::write(project.join(".nemo-relay/config.toml"), "").unwrap();
     std::fs::write(project.join(".nemo-relay/plugins.toml"), "version = 1\n").unwrap();
-    let scope = PluginConfigDiscoveryScope::enter(&nested, &xdg);
-    scope.enable_user_scope();
+    let _scope = PluginConfigDiscoveryScope::enter(&nested, &xdg);
 
     assert_eq!(
         config_paths(None),
         vec![
             xdg.join("nemo-relay/config.toml"),
-            PathBuf::from("/etc/nemo-relay/config.toml"),
+            system_config_dir().join("config.toml"),
         ]
     );
     assert_eq!(
         plugin_config_paths(None, None),
         vec![
             xdg.join("nemo-relay/plugins.toml"),
-            PathBuf::from("/etc/nemo-relay/plugins.toml"),
+            system_config_dir().join("plugins.toml"),
         ]
     );
 }
 
 #[test]
-fn logging_resolution_respects_environment_user_scope() {
+fn logging_resolution_ignores_project_config() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("workspace");
     let nested = project.join("nested");
@@ -1248,23 +1295,19 @@ level = "warn"
 "#,
     )
     .unwrap();
-    let scope = PluginConfigDiscoveryScope::enter(&nested, &xdg);
+    let _scope = PluginConfigDiscoveryScope::enter(&nested, &xdg);
     let has_project_sink = |config: &LoggingConfig| {
         config.sinks.iter().any(
             |sink| matches!(sink, LogSinkConfig::File(file) if file.path == project_sink.as_path()),
         )
     };
 
-    let normal = resolve_logging_config(None, false).unwrap();
-    assert!(has_project_sink(&normal));
-
-    scope.enable_user_scope();
-    let user_only = resolve_logging_config(None, false).unwrap();
-    assert!(!has_project_sink(&user_only));
+    let resolved = resolve_logging_config(None).unwrap();
+    assert!(!has_project_sink(&resolved));
 }
 
 #[test]
-fn operational_logging_aggregates_sinks_from_all_config_layers() {
+fn operational_logging_uses_explicit_config_and_ignores_project_layer() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("workspace");
     let nested = project.join("nested");
@@ -1295,7 +1338,7 @@ fn operational_logging_aggregates_sinks_from_all_config_layers() {
     .unwrap();
     let _scope = PluginConfigDiscoveryScope::enter(&nested, &xdg);
 
-    let logging = resolve_logging_config(Some(&explicit_config), false).unwrap();
+    let logging = resolve_logging_config(Some(&explicit_config)).unwrap();
     let paths = logging
         .sinks
         .iter()
@@ -1304,7 +1347,7 @@ fn operational_logging_aggregates_sinks_from_all_config_layers() {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(paths, vec![project_sink.as_path(), explicit_sink.as_path()]);
+    assert_eq!(paths, vec![explicit_sink.as_path()]);
 }
 
 #[test]
@@ -2048,8 +2091,16 @@ fn plugin_config_path_overrides_sibling_plugin_file() {
     let sibling_path = temp.path().join("plugins.toml");
     let override_path = temp.path().join("override.toml");
     std::fs::write(&config_path, "").unwrap();
-    std::fs::write(&sibling_path, "version = 1\n").unwrap();
-    std::fs::write(&override_path, "version = 2\n").unwrap();
+    std::fs::write(
+        &sibling_path,
+        "version = 1\n[policy]\nunknown_field = \"warn\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &override_path,
+        "version = 1\n[policy]\nunknown_field = \"error\"\n",
+    )
+    .unwrap();
     let command = RunOverrides {
         agent: Some(CodingAgent::Codex),
         config: Some(config_path),
@@ -2066,7 +2117,10 @@ fn plugin_config_path_overrides_sibling_plugin_file() {
 
     assert_eq!(
         resolved.gateway.plugin_config,
-        Some(json!({ "version": 2 }))
+        Some(json!({
+            "version": 1,
+            "policy": { "unknown_field": "error" }
+        }))
     );
 }
 
@@ -2585,6 +2639,79 @@ fn bootstrap_hmac_key_creation_is_concurrency_safe_and_stable() {
     assert_eq!(std::fs::metadata(path).unwrap().len(), 32);
 }
 
+#[cfg(unix)]
+#[test]
+fn bootstrap_hmac_key_completes_empty_private_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state/fingerprint-hmac.key");
+    let parent = path.parent().unwrap();
+    std::fs::create_dir_all(parent).unwrap();
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::File::create(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let key = load_or_create_bootstrap_hmac_key_at(&path).unwrap();
+
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 32);
+    assert_eq!(load_or_create_bootstrap_hmac_key_at(&path).unwrap(), key);
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_hmac_key_reuses_private_state_without_changing_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state/fingerprint-hmac.key");
+    let original = load_or_create_bootstrap_hmac_key_at(&path).unwrap();
+    let parent = path.parent().unwrap();
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+    let reloaded = load_or_create_bootstrap_hmac_key_at(&path).unwrap();
+
+    assert_eq!(reloaded, original);
+    assert_eq!(
+        std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+        0o500
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o400
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_hmac_key_repairs_group_or_other_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state/fingerprint-hmac.key");
+    let original = load_or_create_bootstrap_hmac_key_at(&path).unwrap();
+    let parent = path.parent().unwrap();
+
+    for (directory_mode, key_mode) in [(0o750, 0o640), (0o701, 0o604)] {
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(directory_mode)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(key_mode)).unwrap();
+
+        assert_eq!(
+            load_or_create_bootstrap_hmac_key_at(&path).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn bootstrap_hmac_key_uses_and_repairs_a_private_windows_dacl() {
@@ -2756,7 +2883,7 @@ fn persistent_hook_identity_authenticates_python_marker_without_rehashing_enviro
         "persistent hook identity must trust only the authenticated environment marker"
     );
 
-    let resolved = load_shared_config_scoped(None, None, true).unwrap();
+    let resolved = load_shared_config(None, None).unwrap();
     let active = active_dynamic_plugin_components(None, &resolved).unwrap();
     assert_eq!(active.len(), 1);
     assert!(active[0].activation_snapshot.is_some());
@@ -2954,10 +3081,10 @@ fn bootstrap_hmac_key_rejects_corrupt_persistent_state() {
 }
 
 #[test]
-fn persistent_server_resolution_rejects_project_specific_flags() {
+fn persistent_server_resolution_rejects_explicit_config_flags() {
     let _cwd = crate::test_support::CwdTestScope::locked();
     let args = GatewayOverrides {
-        config: Some(PathBuf::from("project-config.toml")),
+        config: Some(PathBuf::from("explicit-config.toml")),
         ..GatewayOverrides::default()
     };
 
@@ -3418,6 +3545,38 @@ fn malformed_shared_config_reports_context() {
 
     assert!(error.contains("invalid gateway configuration shape"));
 
+    let invalid_upstream_key = temp.path().join("invalid-upstream-key.toml");
+    std::fs::write(
+        &invalid_upstream_key,
+        "[upstream]\nopenai_baseurl = \"https://example.test/v1\"\n",
+    )
+    .unwrap();
+    let args = GatewayOverrides {
+        config: Some(invalid_upstream_key),
+        ..GatewayOverrides::default()
+    };
+
+    let error = resolve_server_config(&args).unwrap_err().to_string();
+
+    assert!(error.contains("invalid gateway configuration shape"));
+    assert!(error.contains("openai_baseurl"));
+
+    let invalid_nested_upstream = temp.path().join("invalid-nested-upstream.toml");
+    std::fs::write(
+        &invalid_nested_upstream,
+        "[upstream.openai]\nbase_url = \"https://example.test/v1\"\n",
+    )
+    .unwrap();
+    let args = GatewayOverrides {
+        config: Some(invalid_nested_upstream),
+        ..GatewayOverrides::default()
+    };
+
+    let error = resolve_server_config(&args).unwrap_err().to_string();
+
+    assert!(error.contains("invalid gateway configuration shape"));
+    assert!(error.contains("openai"));
+
     let plugin_config = temp.path().join("config-with-invalid-plugins.toml");
     std::fs::write(&plugin_config, "").unwrap();
     std::fs::write(temp.path().join("plugins.toml"), "version = [").unwrap();
@@ -3783,7 +3942,7 @@ fn logging_defaults_when_section_absent() {
     let resolved = resolve_server_config(&args).unwrap();
 
     assert_eq!(resolved.logging, LoggingConfig::default());
-    assert_eq!(resolved.logging.level, LogLevel::Info);
+    assert_eq!(resolved.logging.level, LogLevel::Error);
     assert_eq!(resolved.logging.stderr_format, LogFormat::Human);
     assert!(resolved.logging.sinks.is_empty());
 }
@@ -4136,4 +4295,109 @@ level = "error"
             None => std::env::remove_var("RUST_LOG"),
         }
     }
+}
+
+#[test]
+fn configuration_value_helpers_cover_empty_and_invalid_shapes() {
+    let source = Path::new("plugins.toml");
+    let mut scalar = toml::Value::String("not a table".into());
+    let resolved =
+        resolve_dynamic_plugin_refs(source, &mut scalar, &mut std::collections::HashSet::new())
+            .unwrap();
+    assert!(resolved.dynamic_plugins.is_empty());
+    assert_eq!(
+        resolved.dynamic_plugin_policy,
+        DynamicPluginHostPolicy::default()
+    );
+
+    let value: toml::Value = toml::from_str(
+        r#"
+[plugins]
+dynamic = []
+[plugins.policy]
+rules = []
+[other]
+enabled = true
+"#,
+    )
+    .unwrap();
+    let cleaned = remove_dynamic_plugin_sections(value);
+    assert!(cleaned.get("plugins").is_none());
+    assert_eq!(cleaned["other"]["enabled"].as_bool(), Some(true));
+    assert_eq!(plugin_toml_runtime_value(json!({})), None);
+    assert_eq!(
+        plugin_toml_runtime_value(json!({"enabled": true})),
+        Some(json!({"enabled": true}))
+    );
+
+    assert!(validate_auth_header("AUTH", "   ".into()).is_err());
+    assert!(parse_env_body_limit("LIMIT", "not-a-number").is_err());
+    assert_eq!(parse_env_body_limit("LIMIT", "17").unwrap(), 17);
+}
+
+#[test]
+fn logging_path_and_sink_helpers_cover_lexical_fallbacks() {
+    let temp = tempfile::tempdir().unwrap();
+    let existing_parent = temp.path().join("logs");
+    std::fs::create_dir_all(&existing_parent).unwrap();
+    let canonical = std::fs::canonicalize(&existing_parent)
+        .unwrap()
+        .join("relay.log");
+    assert_eq!(
+        logging_path_identity(&existing_parent.join("relay.log")),
+        canonical
+    );
+
+    let lexical = logging_path_identity(&temp.path().join("missing/../nested/relay.log"));
+    assert!(lexical.ends_with("nested/relay.log"));
+    assert_eq!(
+        normalize_path_components(Path::new("a/./b/../c")),
+        PathBuf::from("a/c")
+    );
+    assert_eq!(
+        normalize_path_components(Path::new("single")),
+        PathBuf::from("single")
+    );
+
+    let path = temp.path().join("coalesced.log");
+    let lower = toml::Value::Table(toml::Table::from_iter([
+        (
+            "path".into(),
+            toml::Value::String(path.display().to_string()),
+        ),
+        ("level".into(), toml::Value::String("info".into())),
+    ]));
+    let higher = toml::Value::Table(toml::Table::from_iter([
+        (
+            "path".into(),
+            toml::Value::String(path.display().to_string()),
+        ),
+        ("format".into(), toml::Value::String("json".into())),
+    ]));
+    let coalesced = coalesce_logging_sinks(vec![lower, higher]);
+    assert_eq!(coalesced.len(), 1);
+    assert_eq!(coalesced[0]["level"].as_str(), Some("info"));
+    assert_eq!(coalesced[0]["format"].as_str(), Some("json"));
+
+    let mut invalid_higher: toml::Value = toml::from_str("[logging]\nsinks = 'invalid'").unwrap();
+    let lower = toml::Value::Table(toml::Table::new());
+    merge_logging_sinks_by_path(&lower, &mut invalid_higher);
+    assert_eq!(invalid_higher["logging"]["sinks"].as_str(), Some("invalid"));
+}
+
+#[test]
+fn dynamic_plugin_identity_allows_worker_without_manifest() {
+    let component = ActiveDynamicPluginComponent {
+        plugin_id: "acme.manual-worker".into(),
+        kind: DynamicPluginKind::Worker,
+        lifecycle_generation: 7,
+        manifest_ref: None,
+        environment_ref: None,
+        config: serde_json::Map::new(),
+        activation_snapshot: None,
+    };
+    let identity = dynamic_plugin_bootstrap_identity(&component).unwrap();
+    assert_eq!(identity["plugin_id"], "acme.manual-worker");
+    assert_eq!(identity["manifest"], Value::Null);
+    assert_eq!(identity["lifecycle_generation"], 7);
 }

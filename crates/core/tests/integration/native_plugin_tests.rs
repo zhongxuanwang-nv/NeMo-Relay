@@ -22,7 +22,9 @@ use nemo_relay::api::scope::{
     pop_scope, push_scope,
 };
 use nemo_relay::api::subscriber::{deregister_subscriber, flush_subscribers, register_subscriber};
-use nemo_relay::api::tool::{ToolCallExecuteParams, tool_call_execute, tool_request_intercepts};
+use nemo_relay::api::tool::{
+    ToolCallExecuteParams, ToolExecutionResult, tool_call_execute, tool_request_intercepts,
+};
 use nemo_relay::codec::response::AnnotatedLlmResponse;
 use nemo_relay::plugin::dynamic::{
     DynamicPluginActivationSpec, DynamicPluginKind, NativePluginLoadSpec, PluginHostActivation,
@@ -228,6 +230,8 @@ async fn sdk_cdylib_registers_tool_request_intercept() {
     cleanup.mark_subscriber_registered("native_plugin_fixture_events");
 
     let stack = create_scope_stack();
+    let tool_callback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let captured_tool_callback_calls = Arc::clone(&tool_callback_calls);
     let (outer_uuid, rewritten, tool_result) = TASK_SCOPE_STACK
         .scope(stack, async {
             let outer = push_scope(
@@ -244,9 +248,16 @@ async fn sdk_cdylib_registers_tool_request_intercept() {
             let tool_result = tool_call_execute(
                 ToolCallExecuteParams::builder()
                     .name("native-fixture-tool")
-                    .args(json!({ "input": "execute" }))
-                    .func(Arc::new(|args| {
-                        Box::pin(async move { Ok(json!({ "tool_callback": true, "args": args })) })
+                    .args(json!({ "input": "execute", "use_concurrent_next": true }))
+                    .func(Arc::new(move |args| {
+                        let calls = Arc::clone(&captured_tool_callback_calls);
+                        Box::pin(async move {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Ok(ToolExecutionResult::annotated(
+                                json!({ "tool_callback": true, "args": args }),
+                                json!({"source": "provider"}),
+                            ))
+                        })
                     }))
                     .build(),
             )
@@ -259,13 +270,18 @@ async fn sdk_cdylib_registers_tool_request_intercept() {
         .await;
     assert_eq!(rewritten["input"], "value");
     assert_eq!(rewritten["native_plugin"], true);
-    assert_eq!(tool_result["tool_callback"], true);
-    assert_eq!(tool_result["native_plugin_tool_execution"], true);
+    assert_eq!(tool_result.result["tool_callback"], true);
+    assert_eq!(tool_result.result["native_plugin_tool_execution"], true);
+    assert_eq!(tool_result.annotation, Some(json!({"source": "provider"})));
     assert_eq!(
-        tool_result["args"]["native_plugin_tool_execution_request"],
+        tool_callback_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        tool_result.result["args"]["native_plugin_tool_execution_request"],
         true
     );
-    assert!(tool_result.get("pending_marks").is_none());
+    assert!(tool_result.result.get("pending_marks").is_none());
 
     flush_subscribers().expect("native fixture events should flush");
     let first_events = events.lock().unwrap().clone();
@@ -397,15 +413,15 @@ async fn sdk_cdylib_registers_tool_request_intercept() {
                                     .name("native-fixture-tool-callback-mark")
                                     .build(),
                             )?;
-                            Ok(json!({ "tool_callback": true }))
+                            Ok(ToolExecutionResult::new(json!({ "tool_callback": true })))
                         })
                     }))
                     .build(),
             )
             .await
             .expect("native isolated next middleware should run");
-            assert_eq!(result["tool_callback"], true);
-            assert_eq!(result["native_plugin_tool_execution"], true);
+            assert_eq!(result.result["tool_callback"], true);
+            assert_eq!(result.result["native_plugin_tool_execution"], true);
             pop_scope(PopScopeParams::builder().handle_uuid(&outer.uuid).build())
                 .expect("isolated next outer scope should pop");
             outer_uuid
@@ -711,12 +727,14 @@ async fn native_v3_async_registration_supports_all_middleware_kinds() {
         ToolCallExecuteParams::builder()
             .name("async-execution")
             .args(json!({"input": true}))
-            .func(Arc::new(|args| Box::pin(async move { Ok(args) })))
+            .func(Arc::new(|args| {
+                Box::pin(async move { Ok(ToolExecutionResult::new(args)) })
+            }))
             .build(),
     )
     .await
     .expect("v3 async execution intercept should continue with next");
-    assert_eq!(executed["native_async_execution"], true);
+    assert_eq!(executed.result["native_async_execution"], true);
 
     let llm_response = llm_call_execute(
         LlmCallExecuteParams::builder()
@@ -777,7 +795,7 @@ async fn native_v3_async_registration_supports_all_middleware_kinds() {
     let pending = tokio::spawn(async {
         tool_request_intercepts("async-pending", json!({"input": true})).await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while !unsafe { pending_entered() } {
             tokio::task::yield_now().await;
         }
@@ -814,7 +832,7 @@ async fn native_v3_async_registration_supports_all_middleware_kinds() {
         )
         .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while !unsafe { pending_entered() } {
             tokio::task::yield_now().await;
         }
@@ -871,7 +889,7 @@ async fn native_tool_execution_rejects_null_malformed_and_error_outcomes() {
     let manifest_ref =
         write_manifest_with_symbol(&fixture, "nemo_relay_fixture_tool_outcome_errors");
     let activation = load_native_plugins([load_spec("fixture_native", &manifest_ref)])
-        .expect("raw native outcome fixture should load");
+        .expect("native outcome fixture should load");
     let mut cleanup = NativePluginTestCleanup::new();
 
     let mut plugin_config = PluginConfig::default();
@@ -882,7 +900,7 @@ async fn native_tool_execution_rejects_null_malformed_and_error_outcomes() {
     });
     initialize_plugins_exact(plugin_config)
         .await
-        .expect("raw native outcome fixture should initialize");
+        .expect("native outcome fixture should initialize");
     cleanup.mark_plugin_configuration_active();
 
     for (name, expected) in [
@@ -903,7 +921,9 @@ async fn native_tool_execution_rejects_null_malformed_and_error_outcomes() {
             ToolCallExecuteParams::builder()
                 .name(name)
                 .args(json!({ "input": true }))
-                .func(Arc::new(|args| Box::pin(async move { Ok(args) })))
+                .func(Arc::new(|args| {
+                    Box::pin(async move { Ok(ToolExecutionResult::new(args)) })
+                }))
                 .build(),
         )
         .await
@@ -915,24 +935,55 @@ async fn native_tool_execution_rejects_null_malformed_and_error_outcomes() {
         );
     }
 
+    drop(cleanup);
+    activation.clear();
+}
+
+#[tokio::test]
+async fn native_api_one_preserves_results_after_abi_v2_negotiation() {
+    let _guard = NATIVE_PLUGIN_TEST_LOCK.lock().await;
+    let fixture = build_fixture_plugin();
+    let manifest_ref = write_manifest_with_symbol(&fixture, "nemo_relay_fixture_abi_v2_api1");
+    let activation = load_native_plugins([load_spec("fixture_native", &manifest_ref)])
+        .expect("native API 1 plugin should negotiate the ABI v2 host table");
+    let mut cleanup = NativePluginTestCleanup::new();
+
+    let mut plugin_config = PluginConfig::default();
+    plugin_config.components.push(PluginComponentSpec {
+        kind: "fixture_native".into(),
+        enabled: true,
+        config: Map::new(),
+    });
+    initialize_plugins_exact(plugin_config)
+        .await
+        .expect("ABI v2 native API 1 fixture should initialize");
+    cleanup.mark_plugin_configuration_active();
+
     let result = tool_call_execute(
         ToolCallExecuteParams::builder()
-            .name("fixture-valid-outcome")
-            .args(json!({ "input": true }))
-            .func(Arc::new(|args| Box::pin(async move { Ok(args) })))
+            .name("fixture-abi-v2-api1")
+            .args(json!({"input": true}))
+            .func(Arc::new(|args| {
+                Box::pin(async move {
+                    Ok(ToolExecutionResult::annotated(
+                        args,
+                        json!({"source": "provider"}),
+                    ))
+                })
+            }))
             .build(),
     )
     .await
-    .expect("native loader should remain usable after rejected outcomes");
-    assert_eq!(result["raw_tool_outcome"], true);
-    assert!(result.get("pending_marks").is_none());
+    .expect("ABI v2 callback should use the canonical native API 1 result contract");
+    assert_eq!(result.result, json!({"input": true}));
+    assert_eq!(result.annotation, Some(json!({"source": "provider"})));
 
     drop(cleanup);
     activation.clear();
 }
 
 #[tokio::test]
-async fn native_event_sanitizer_callback_errors_preserve_observability_fields() {
+async fn native_event_sanitizer_callback_errors_clear_observability_fields() {
     let _guard = NATIVE_PLUGIN_TEST_LOCK.lock().await;
     let fixture = build_fixture_plugin();
     let manifest_ref =
@@ -973,8 +1024,8 @@ async fn native_event_sanitizer_callback_errors_preserve_observability_fields() 
 
     let captured_events = events.lock().unwrap().clone();
     let event = find_event(&captured_events, "native-event-sanitize-error", None);
-    assert_eq!(event.data(), Some(&json!({ "secret": true })));
-    assert_eq!(event.metadata(), Some(&json!({ "secret": true })));
+    assert_eq!(event.data(), None);
+    assert_eq!(event.metadata(), None);
 
     deregister_subscriber("native_event_sanitizer_error_capture")
         .expect("test subscriber should deregister");
@@ -1030,7 +1081,7 @@ fn native_activation_clear_deregisters_plugin_kind() {
 }
 
 #[tokio::test]
-async fn native_request_intercept_rejects_manifest_that_admits_relay_0_5() {
+async fn native_loader_rejects_manifest_that_admits_pre_zero_eight_relay() {
     let _guard = NATIVE_PLUGIN_TEST_LOCK.lock().await;
     let fixture = build_fixture_plugin();
     let manifest_ref = write_manifest_text(ManifestOptions {
@@ -1041,26 +1092,14 @@ async fn native_request_intercept_rejects_manifest_that_admits_relay_0_5() {
         symbol: "nemo_relay_fixture_native_plugin",
         integrity: None,
     });
-    let activation = load_native_plugins([load_spec("fixture_native", &manifest_ref)])
-        .expect("the host version is in the broad manifest range");
-
-    let mut plugin_config = PluginConfig::default();
-    plugin_config.components.push(PluginComponentSpec {
-        kind: "fixture_native".into(),
-        enabled: true,
-        config: Map::new(),
-    });
-    let error = initialize_plugins_exact(plugin_config)
-        .await
-        .expect_err("the request-intercept registration should reject Relay 0.5 compatibility")
-        .to_string();
+    let error = expect_native_load_error_from_specs(
+        [load_spec("fixture_native", &manifest_ref)],
+        "the native loader should reject pre-0.8 Relay compatibility",
+    );
     assert!(
-        error.contains("llm request intercept failed: InvalidArg"),
+        error.contains("excludes Relay versions before 0.8"),
         "{error}"
     );
-
-    clear_plugin_configuration().expect("failed initialization state should clear");
-    activation.clear();
 }
 
 #[test]
@@ -1198,7 +1237,7 @@ fn native_loader_rejects_manifest_contract_errors_before_loading_library() {
         &native_manifest_text(
             "fixture_native",
             &format!("={}", env!("CARGO_PKG_VERSION")),
-            "2",
+            "3",
             "libdoes-not-need-to-exist.so",
             "nemo_relay_fixture_native_plugin",
         ),
@@ -1210,7 +1249,7 @@ fn native_loader_rejects_manifest_contract_errors_before_loading_library() {
         },
         "unsupported native API should fail",
     );
-    assert!(error.contains("unsupported compat.native_api"), "{error}");
+    assert!(error.contains("compat.native_api = \"1\""), "{error}");
 
     let worker_manifest = write_raw_manifest(
         manifest_dir.path(),
@@ -1222,7 +1261,7 @@ id = "fixture_worker"
 kind = "worker"
 
 [compat]
-relay = ">=0.5,<1.0"
+relay = ">=0.8,<1.0"
 worker_protocol = "grpc-v1"
 
 [defaults]
@@ -1461,19 +1500,22 @@ async fn plugin_host_activation_combines_static_base_and_dynamic_components() {
 async fn plugin_host_activation_layers_discovered_static_base_with_dynamic_components() {
     if std::env::var_os(PLUGIN_DISCOVERY_TEST_CHILD).is_none() {
         let environment = TempDir::new().expect("plugin discovery environment should be created");
-        let project_config_dir = environment.path().join(".nemo-relay");
-        std::fs::create_dir_all(&project_config_dir)
-            .expect("project plugin config directory should be created");
+        let xdg_config_home = environment.path().join("xdg");
+        let user_config_dir = xdg_config_home.join("nemo-relay");
+        std::fs::create_dir_all(&user_config_dir)
+            .expect("user plugin config directory should be created");
         std::fs::write(
-            project_config_dir.join("plugins.toml"),
+            user_config_dir.join("plugins.toml"),
             format!(
                 "version = 1\n\n[[components]]\nkind = {STATIC_BASE_PLUGIN_KIND:?}\nenabled = true\n"
             ),
         )
-        .expect("project plugin config should be written");
-        let xdg_config_home = environment.path().join("xdg");
-        std::fs::create_dir_all(&xdg_config_home)
-            .expect("isolated user config directory should be created");
+        .expect("user plugin config should be written");
+        let legacy_project_dir = environment.path().join(".nemo-relay");
+        std::fs::create_dir_all(&legacy_project_dir)
+            .expect("legacy project config directory should be created");
+        std::fs::write(legacy_project_dir.join("plugins.toml"), "components = [\n")
+            .expect("malformed legacy project config should be written");
 
         let output = Command::new(std::env::current_exe().expect("test executable should resolve"))
             .args([
@@ -1561,7 +1603,9 @@ async fn plugin_host_clear_allows_an_in_flight_native_callback_to_finish() {
                             .map_err(|error| {
                                 nemo_relay::error::FlowError::Internal(error.to_string())
                             })?;
-                        Ok(json!({ "tool_callback": true, "args": args }))
+                        Ok(ToolExecutionResult::new(
+                            json!({ "tool_callback": true, "args": args }),
+                        ))
                     })
                 }))
                 .build(),
@@ -1569,7 +1613,7 @@ async fn plugin_host_clear_allows_an_in_flight_native_callback_to_finish() {
     });
 
     entered_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
+        .recv_timeout(std::time::Duration::from_secs(5))
         .expect("native callback should enter its continuation");
     activation
         .clear()
@@ -1586,8 +1630,8 @@ async fn plugin_host_clear_allows_an_in_flight_native_callback_to_finish() {
         .join()
         .expect("in-flight callback thread should not panic")
         .expect("in-flight callback should finish after host clear");
-    assert_eq!(result["tool_callback"], true);
-    assert_eq!(result["native_plugin_tool_execution"], true);
+    assert_eq!(result.result["tool_callback"], true);
+    assert_eq!(result.result["native_plugin_tool_execution"], true);
 }
 
 #[tokio::test]
@@ -2034,8 +2078,6 @@ fn find_event<'a>(
 }
 
 struct BuiltFixture {
-    _source_dir: TempDir,
-    _target_dir: TempDir,
     manifest_dir: TempDir,
     library_path: PathBuf,
 }
@@ -2043,52 +2085,28 @@ struct BuiltFixture {
 fn build_fixture_plugin() -> BuiltFixture {
     let _ = spdlog::init_log_crate_proxy();
     log::set_max_level(log::LevelFilter::Info);
-    let source_dir = TempDir::new().expect("fixture source dir");
-    let fixture_dir = source_dir.path().join("native_plugin");
-    let fixture_src_dir = fixture_dir.join("src");
-    std::fs::create_dir_all(&fixture_src_dir).expect("fixture src dir");
-    let native_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin");
-    let fixture_manifest = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native_plugin/Cargo.toml"),
-    )
-    .expect("fixture Cargo.toml template")
-    .replace(
-        r#"nemo-relay-plugin = { path = "../../../../plugin" }"#,
-        &format!("nemo-relay-plugin = {{ path = {native_path:?} }}"),
-    );
-    std::fs::write(fixture_dir.join("Cargo.toml"), fixture_manifest).expect("fixture Cargo.toml");
-    std::fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native_plugin/src/lib.rs"),
-        fixture_src_dir.join("lib.rs"),
-    )
-    .expect("fixture lib.rs");
-    let target_dir = TempDir::new().expect("fixture target dir");
     let manifest_dir = TempDir::new().expect("fixture manifest dir");
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let status = Command::new(cargo)
-        .arg("build")
-        .arg("--quiet")
-        .arg("--manifest-path")
-        .arg(fixture_dir.join("Cargo.toml"))
-        .arg("--target-dir")
-        .arg(target_dir.path())
-        .status()
-        .expect("fixture cargo build should start");
-    assert!(status.success(), "fixture cargo build failed: {status}");
-
-    let library_path = target_dir.path().join("debug").join(fixture_library_name());
+    let library_path = prepared_plugin_fixture("NEMO_RELAY_TEST_NATIVE_PLUGIN");
     assert!(
         library_path.exists(),
-        "fixture library missing at {}",
+        "fixture library is missing; run `just build-test-plugin-fixtures`: {}",
         library_path.display()
     );
 
     BuiltFixture {
-        _source_dir: source_dir,
-        _target_dir: target_dir,
         manifest_dir,
         library_path,
     }
+}
+
+fn prepared_plugin_fixture(environment: &str) -> PathBuf {
+    std::env::var_os(environment)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/test-plugin-fixtures/debug")
+                .join(fixture_library_name())
+        })
 }
 
 fn write_manifest(fixture: &BuiltFixture) -> PathBuf {

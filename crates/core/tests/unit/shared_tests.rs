@@ -121,6 +121,54 @@ fn test_metadata_with_otel_status_only_describes_errors() {
 }
 
 #[test]
+fn test_metadata_with_otel_error_adds_structured_error_type() {
+    let metadata = metadata_with_otel_error(
+        Some(json!({"caller": "shared-error"})),
+        &FlowError::Internal("provider timed out".into()),
+    )
+    .unwrap();
+
+    assert_eq!(metadata["otel.status_code"], json!("ERROR"));
+    assert_eq!(metadata["error.type"], json!("internal_error"));
+    assert_eq!(
+        metadata["otel.status_description"],
+        json!("internal error: provider timed out")
+    );
+
+    let explicit_metadata = metadata_with_otel_error(
+        Some(json!({"error.type": "provider_timeout"})),
+        &FlowError::Internal("provider timed out".into()),
+    )
+    .unwrap();
+
+    assert_eq!(explicit_metadata["error.type"], json!("provider_timeout"));
+
+    let external_metadata = metadata_with_otel_error(
+        None,
+        &FlowError::CallbackException {
+            message: "ValueError: boom".into(),
+            exception_type: "ValueError".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(external_metadata["error.type"], json!("internal_error"));
+    assert_eq!(external_metadata["exception.type"], json!("ValueError"));
+
+    let explicit_exception_metadata = metadata_with_otel_error(
+        Some(json!({"exception.type": "CallerException"})),
+        &FlowError::CallbackException {
+            message: "ValueError: boom".into(),
+            exception_type: "ValueError".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        explicit_exception_metadata["exception.type"],
+        json!("CallerException")
+    );
+}
+
+#[test]
 fn test_resolve_parent_uuid_snapshot_and_runtime_owner_helpers() {
     let _guard = lock_runtime_owner();
     reset_global();

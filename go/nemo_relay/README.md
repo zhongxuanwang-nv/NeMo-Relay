@@ -110,6 +110,12 @@ import (
 )
 
 func main() {
+	defer func() {
+		if err := nemo.ShutdownLogging(); err != nil {
+			log.Printf("shut down NeMo Relay logging: %v", err)
+		}
+	}()
+
 	if err := nemo.RegisterSubscriber("printer", func(event nemo.Event) {
 		fmt.Printf("%s %s\n", event.Kind(), event.Name())
 		fmt.Println(string(event.JSON()))
@@ -129,12 +135,12 @@ func main() {
 		log.Fatal(err)
 	}
 
-	result, err := tools.Execute("search", json.RawMessage(`{"query":"hello"}`), func(args json.RawMessage) (json.RawMessage, error) {
-		return args, nil
+	result, err := tools.Execute("search", json.RawMessage(`{"query":"hello"}`), func(args json.RawMessage) (nemo.ToolExecutionResult, error) {
+		return nemo.ToolExecutionResult{Result: args}, nil
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(string(result))
+	fmt.Println(string(result.Result))
 }
 ```

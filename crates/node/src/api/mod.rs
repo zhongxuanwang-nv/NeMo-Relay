@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use chrono::{DateTime, Utc};
@@ -41,6 +41,7 @@ use nemo_relay::api::runtime::{
 use nemo_relay::api::runtime::{
     TASK_SCOPE_STACK, capture_propagation_context as capture_propagation_context_handle,
     capture_propagation_context_with_root as capture_propagation_context_with_root_handle,
+    capture_traceparent as capture_traceparent_handle,
     create_scope_stack as create_scope_stack_handle,
     create_scope_stack_from_propagation as create_scope_stack_from_propagation_handle,
     current_scope_stack as current_scope_stack_handle, scope_stack_active as scope_stack_is_active,
@@ -86,7 +87,32 @@ use crate::convert::{
 use crate::promise_call::PromiseAwareFn;
 use crate::promise_call::with_publication_callback_context;
 use crate::stream::LlmStream;
-use crate::types::{LlmHandle, ScopeHandle, ScopeStack, ScopeType, ToolHandle};
+use crate::types::{
+    LlmHandle, ScopeHandle, ScopeStack, ScopeType, ToolExecutionResult, ToolHandle,
+};
+
+static NODE_ENVIRONMENT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static NODE_ENVIRONMENT_LIFECYCLE_LOCK: StdMutex<()> = StdMutex::new(());
+
+fn register_node_environment() -> FlowResult<()> {
+    let _guard = NODE_ENVIRONMENT_LIFECYCLE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    nemo_relay::logging::initialize_default_logging()?;
+    NODE_ENVIRONMENT_COUNT.fetch_add(1, Ordering::AcqRel);
+    Ok(())
+}
+
+fn cleanup_node_environment() {
+    let _guard = NODE_ENVIRONMENT_LIFECYCLE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if NODE_ENVIRONMENT_COUNT.fetch_sub(1, Ordering::AcqRel) == 1
+        && let Err(error) = nemo_relay::logging::shutdown_default_logging()
+    {
+        eprintln!("nemo-relay: operational logging shutdown failed: {error}");
+    }
+}
 
 fn effective_scope_context(
     env: &Env,
@@ -127,7 +153,12 @@ fn init() {
 
 #[cfg(not(test))]
 #[napi_derive::module_exports]
-fn install_well_known_symbol_methods(exports: JsObject, env: Env) -> napi::Result<()> {
+fn install_well_known_symbol_methods(exports: JsObject, mut env: Env) -> napi::Result<()> {
+    register_node_environment().map_err(to_napi_err)?;
+    if let Err(error) = env.add_env_cleanup_hook((), |_| cleanup_node_environment()) {
+        cleanup_node_environment();
+        return Err(error);
+    }
     let activation: JsFunction = exports.get_named_property("DynamicPluginActivation")?;
     let activation = activation.coerce_to_object()?;
     let mut prototype: JsObject = activation.get_named_property("prototype")?;
@@ -485,9 +516,10 @@ pub fn push_stream_chunk(stream_id: f64, chunk: Json) -> bool {
 /// Signal that a stream is complete. Drops the sender so the Rust
 /// receiver sees the channel as closed.
 #[napi]
-pub fn end_stream(stream_id: f64) {
+pub fn end_stream(env: Env, stream_id: f64) -> napi::Result<()> {
     let id = stream_id as u64;
     finish_stream_channel(id, Ok(()));
+    callback_factory::expire_callback_context(&env)
 }
 
 /// # Safety
@@ -687,10 +719,9 @@ fn build_plugin_context(
         move |ctx| {
             let name = format!("{}{}", subscriber_namespace, ctx.get::<String>(0)?);
             let callback = ctx.get::<JsFunction>(1)?;
-            let tsfn = json_callback_tsfn(ctx.env, &callback)?;
             core_subscriber_api::register_subscriber(
                 &name,
-                callable::wrap_js_event_subscriber(tsfn),
+                callable::wrap_js_event_subscriber(ctx.env, name.clone(), callback)?,
             )
             .map_err(to_napi_err)?;
 
@@ -1505,9 +1536,45 @@ impl Drop for PersistentJsFunction {
     }
 }
 
+struct NodePluginValidateCallback {
+    direct: PersistentJsFunction,
+    thread_safe: ThreadsafeFunction<Json, ErrorStrategy::Fatal>,
+    registration_thread: std::thread::ThreadId,
+}
+
+impl NodePluginValidateCallback {
+    fn call(&self, plugin_config: Json) -> napi::Result<Json> {
+        if std::thread::current().id() == self.registration_thread {
+            return self.direct.call_validate(&plugin_config);
+        }
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let status = self.thread_safe.call_with_return_value(
+            plugin_config,
+            ThreadsafeFunctionCallMode::Blocking,
+            move |value: Option<Json>| {
+                let result = callable::unwrap_middleware_result(
+                    callback_json(value),
+                    "JS plugin validate callback failed",
+                )
+                .map_err(|error| napi::Error::from_reason(error.to_string()));
+                let _ = tx.send(result);
+                Ok(())
+            },
+        );
+        if status != napi::Status::Ok {
+            return Err(napi::Error::from_reason(format!(
+                "failed to queue JS plugin validate callback: {status:?}"
+            )));
+        }
+        rx.recv()
+            .map_err(|_| napi::Error::from_reason("JS plugin validate completion channel closed"))?
+    }
+}
+
 struct NodePlugin {
     plugin_kind: String,
-    validate: Option<PersistentJsFunction>,
+    validate: Option<NodePluginValidateCallback>,
     register: ThreadsafeFunction<NodePluginRegisterCall, ErrorStrategy::Fatal>,
 }
 
@@ -1523,7 +1590,7 @@ impl Plugin for NodePlugin {
         let Some(validate) = &self.validate else {
             return vec![];
         };
-        match validate.call_validate(&Json::Object(plugin_config.clone())) {
+        match validate.call(Json::Object(plugin_config.clone())) {
             Ok(Json::Null) => vec![],
             Ok(value) => {
                 serde_json::from_value::<Vec<ConfigDiagnostic>>(value).unwrap_or_else(|e| {
@@ -1694,11 +1761,47 @@ pub fn capture_propagation_context_with_root(
     .map_err(|error| napi::Error::from_reason(error.to_string()))
 }
 
+/// Capture the current Relay context as a W3C `traceparent` value.
+#[napi]
+pub fn capture_traceparent(env: Env) -> napi::Result<String> {
+    if let Some(parent_uuid) = callback_factory::callback_propagation_parent_uuid(&env)? {
+        let parent_uuid = uuid::Uuid::parse_str(&parent_uuid)
+            .map_err(|error| napi::Error::from_reason(format!("invalid parent UUID: {error}")))?;
+        let root_uuid = with_effective_scope_stack(&env, capture_traceparent_handle)
+            .ok()
+            .and_then(|result| result.ok())
+            .and_then(|traceparent| {
+                traceparent
+                    .get(3..35)
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            })
+            .unwrap_or(parent_uuid);
+        return nemo_relay::api::runtime::PropagationContext {
+            version: nemo_relay::api::runtime::PropagationContext::VERSION,
+            root_uuid: Some(root_uuid),
+            parent_uuid,
+        }
+        .to_traceparent()
+        .map_err(|error| napi::Error::from_reason(error.to_string()));
+    }
+    with_effective_scope_stack(&env, capture_traceparent_handle)
+        .map_err(|error| napi::Error::from_reason(error.to_string()))?
+        .map_err(|error| napi::Error::from_reason(error.to_string()))
+}
+
 /// Serialize a Relay causal context to the JSON wire format.
 #[napi]
 pub fn propagation_context_to_json(context: PropagationContext) -> napi::Result<String> {
     propagation_context_from_napi(context)?
         .to_json()
+        .map_err(|error| napi::Error::from_reason(error.to_string()))
+}
+
+/// Convert a rooted Relay propagation context to a W3C `traceparent` value.
+#[napi]
+pub fn propagation_context_to_traceparent(context: PropagationContext) -> napi::Result<String> {
+    propagation_context_from_napi(context)?
+        .to_traceparent()
         .map_err(|error| napi::Error::from_reason(error.to_string()))
 }
 
@@ -1720,10 +1823,13 @@ pub fn create_scope_stack_from_propagation(
         .map_err(|error| napi::Error::from_reason(error.to_string()))
 }
 
-/// Run a synchronous callback with an isolated scope stack installed.
+/// Run a callback with an isolated scope stack installed.
 ///
-/// The stack is restored before this function returns. Asynchronous callbacks
-/// must not rely on this installation after their first `await`.
+/// The caller's stack is restored immediately after callback invocation. When
+/// the callback returns a Promise, the requested stack remains active for that
+/// Promise until it settles and is then expired for inherited detached work.
+/// Use this helper instead of `setThreadScopeStack` to isolate concurrent async
+/// branches.
 #[napi]
 pub fn with_scope_stack(
     env: Env,
@@ -1752,7 +1858,10 @@ pub fn current_scope_stack(env: Env) -> napi::Result<ScopeStack> {
     Ok(ScopeStack::from(current_scope_stack_handle()))
 }
 
-/// Binds a scope stack to the current thread.
+/// Binds a scope stack to the current thread or async resource.
+///
+/// This mutates the current execution resource. Use `withScopeStack` when
+/// concurrent asynchronous branches need isolated stack replacements.
 #[napi]
 pub fn set_thread_scope_stack(env: Env, stack: &ScopeStack) -> napi::Result<()> {
     if callback_factory::set_callback_scope_stack(&env, stack)? {
@@ -2202,7 +2311,7 @@ pub fn tool_call(
 pub fn tool_call_end(
     env: Env,
     handle: &ToolHandle,
-    result: Json,
+    result: ToolExecutionResult,
     data: Option<Json>,
     metadata: Option<Json>,
     timestamp: Option<f64>,
@@ -2212,7 +2321,7 @@ pub fn tool_call_end(
         core_tool_api::tool_call_end(
             core_tool_api::ToolCallEndParams::builder()
                 .handle(&handle.inner)
-                .result(result)
+                .execution_result(result.into())
                 .data_opt(opt_json(data))
                 .metadata_opt(opt_json(metadata))
                 .timestamp_opt(timestamp)
@@ -2231,12 +2340,12 @@ pub fn tool_call_end(
 /// (no Start/End pair) and `GuardrailRejected` is returned. Returns the final
 /// execution result; sanitize guardrails do not rewrite the caller-visible value.
 #[allow(clippy::too_many_arguments)]
-#[napi(ts_return_type = "Promise<unknown>")]
+#[napi(ts_return_type = "Promise<ToolExecutionResult>")]
 pub fn tool_call_execute(
     env: Env,
     name: String,
     args: Json,
-    #[napi(ts_arg_type = "(arg: Json) => any")] func: JsFunction,
+    #[napi(ts_arg_type = "(arg: Json) => ToolExecutionResult")] func: JsFunction,
     handle: Option<&ScopeHandle>,
     attributes: Option<u32>,
     data: Option<Json>,
@@ -2272,6 +2381,7 @@ pub fn tool_call_execute(
                                     .build(),
                             )
                             .await
+                            .map(ToolExecutionResult::from)
                             .map_err(to_napi_err)
                         })
                         .await
@@ -2292,11 +2402,14 @@ pub fn tool_call_execute(
 /// Accepts a raw `JsFunction` instead of `ThreadsafeFunction` so it can create a
 /// promise-aware wrapper with access to `Env`.
 #[allow(clippy::too_many_arguments)]
-#[napi(ts_return_type = "Promise<unknown>")]
+#[napi(ts_return_type = "Promise<ToolExecutionResult>")]
 pub fn tool_call_execute_async(
     env: Env,
     name: String,
     args: Json,
+    #[napi(
+        ts_arg_type = "(arg: Json, signal: AbortSignal) => ToolExecutionResult | Promise<ToolExecutionResult>"
+    )]
     func: JsFunction,
     handle: Option<&ScopeHandle>,
     attributes: Option<u32>,
@@ -2319,7 +2432,14 @@ pub fn tool_call_execute_async(
 
     let exec_fn: ToolExecutionNextFn = std::sync::Arc::new(move |args| {
         let pa_fn = pa_fn.clone();
-        Box::pin(async move { pa_fn.call(args).await })
+        Box::pin(async move {
+            let result = pa_fn.call(args).await?;
+            serde_json::from_value(result).map_err(|error| {
+                FlowError::Internal(format!(
+                    "tool execution callback must return ToolExecutionResult: {error}"
+                ))
+            })
+        })
     });
 
     env.execute_tokio_future(
@@ -2342,6 +2462,7 @@ pub fn tool_call_execute_async(
                                     .build(),
                             )
                             .await
+                            .map(ToolExecutionResult::from)
                             .map_err(to_napi_err)
                         })
                         .await
@@ -2815,8 +2936,9 @@ macro_rules! napi_event_guardrail_api {
         /// The callback may return fields directly or in a Promise. Scope and mark
         /// calls queue the event and return synchronously; publication resumes after
         /// the Promise settles. Callback, serialization, conversion, or invalid-result
-        /// failures preserve the last valid event fields and record the error for
-        /// `getLastCallbackError()`.
+        /// failures clear the emitted event fields and record the error for
+        /// `getLastCallbackError()`. Await `flushSubscribers()` before inspecting
+        /// either the delivered event or that error.
         #[napi]
         pub fn $register_name(
             env: Env,
@@ -2894,7 +3016,7 @@ napi_guardrail_tool_api!(
     ///
     /// The `guardrail` callback receives `(toolName, args)` and must return sanitized args.
     /// Higher `priority` values run first. Throws if a guardrail with the same `name` already exists.
-    /// If the callback throws, Relay preserves the current emitted payload and records the error
+    /// If the callback throws, Relay omits the emitted payload and records the error
     /// for `getLastCallbackError()`.
     register_tool_sanitize_request_guardrail,
     /// Deregister a tool request sanitization guardrail by name.
@@ -2911,7 +3033,7 @@ napi_guardrail_tool_api!(
     ///
     /// The `guardrail` callback receives `(toolName, result)` and must return sanitized result.
     /// Higher `priority` values run first. Throws if a guardrail with the same `name` already exists.
-    /// If the callback throws, Relay preserves the current emitted payload and records the error
+    /// If the callback throws, Relay omits the emitted payload and records the error
     /// for `getLastCallbackError()`.
     register_tool_sanitize_response_guardrail,
     /// Deregister a tool response sanitization guardrail by name.
@@ -3030,7 +3152,7 @@ pub fn register_tool_execution_intercept(
     name: String,
     priority: i32,
     #[napi(
-        ts_arg_type = "(args: Json, next: (args: Json) => Json | Promise<Json>) => { result: Json; pendingMarks?: Array<{ name: string; category?: string | null; categoryProfile?: Json; data?: Json; metadata?: Json }> } | Promise<{ result: Json; pendingMarks?: Array<{ name: string; category?: string | null; categoryProfile?: Json; data?: Json; metadata?: Json }> }>"
+        ts_arg_type = "(args: Json, next: (args: Json) => ToolExecutionResult | Promise<ToolExecutionResult>) => { result: Json; annotation?: Json; pendingMarks?: Array<{ name: string; category?: string | null; categoryProfile?: Json; data?: Json; metadata?: Json }> } | Promise<{ result: Json; annotation?: Json; pendingMarks?: Array<{ name: string; category?: string | null; categoryProfile?: Json; data?: Json; metadata?: Json }> }>"
     )]
     callable: JsFunction,
 ) -> Result<()> {
@@ -3064,8 +3186,8 @@ pub fn deregister_tool_execution_intercept(name: String) -> Result<bool> {
 ///
 /// The `guardrail` callback receives `(request, context)` and must return the sanitized request,
 /// or `null` to omit the observability payload. Lower `priority` values run first. Throws if a
-/// guardrail with the same `name` already exists. If the callback throws, Relay preserves the last
-/// valid payload, continues publication, and records the error for `getLastCallbackError()`.
+/// guardrail with the same `name` already exists. If the callback throws, Relay omits the payload
+/// and annotation, continues publication, and records the error for `getLastCallbackError()`.
 #[napi]
 pub fn register_llm_sanitize_request_guardrail(
     env: Env,
@@ -3098,8 +3220,8 @@ pub fn deregister_llm_sanitize_request_guardrail(name: String) -> Result<bool> {
 ///
 /// The `guardrail` callback receives `(response, context)` and must return the sanitized response,
 /// or `null` to omit the observability payload. Lower `priority` values run first. Throws if a
-/// guardrail with the same `name` already exists. If the callback throws, Relay preserves the last
-/// valid payload, continues publication, and records the error for `getLastCallbackError()`.
+/// guardrail with the same `name` already exists. If the callback throws, Relay omits the payload
+/// and annotation, continues publication, and records the error for `getLastCallbackError()`.
 #[napi]
 pub fn register_llm_sanitize_response_guardrail(
     env: Env,
@@ -3291,16 +3413,18 @@ pub fn deregister_llm_stream_execution_intercept(name: String) -> Result<bool> {
 
 /// Register a named event subscriber that receives all lifecycle events.
 ///
-/// The `callback` receives each event as the canonical JSON event object. Events are
-/// delivered asynchronously and non-blocking. Throws if a subscriber with the same `name`
-/// already exists.
+/// The `callback` receives each event as the canonical JSON event object and may return a
+/// Promise. Events are delivered asynchronously and non-blocking. Callback failures are
+/// isolated, reported to stderr and `getLastCallbackError()`, and do not reject
+/// `flushSubscribers()`. Throws if a subscriber with the same `name` already exists.
 #[napi]
 pub fn register_subscriber(
+    env: Env,
     name: String,
-    callback: ThreadsafeFunction<Json, ErrorStrategy::Fatal>,
+    #[napi(ts_arg_type = "(event: Json) => void | Promise<void>")] callback: JsFunction,
 ) -> Result<()> {
-    core_subscriber_api::register_subscriber(&name, callable::wrap_js_event_subscriber(callback))
-        .map_err(to_napi_err)
+    let callback = callable::wrap_js_event_subscriber(&env, name.clone(), callback)?;
+    core_subscriber_api::register_subscriber(&name, callback).map_err(to_napi_err)
 }
 
 /// Deregister an event subscriber by name.
@@ -3312,18 +3436,17 @@ pub fn deregister_subscriber(name: String) -> Result<bool> {
     core_subscriber_api::deregister_subscriber(&name).map_err(to_napi_err)
 }
 
-/// Return a Promise that resolves when native subscriber callbacks queued
-/// before this call finish.
+/// Return a Promise that resolves when native and JavaScript subscriber callbacks and
+/// managed terminal publications registered before this call finish.
 ///
 /// Call this function outside subscribers, event sanitizers, conditional
 /// guardrails, and request or execution intercepts. A queued tool or LLM
 /// observability sanitizer may call it, but the Promise resolves without
 /// waiting for its own publication.
 ///
-/// JavaScript subscribers are queued through Node's `ThreadsafeFunction`. Awaiting this
-/// Promise does not block the Node event loop while Promise-returning event sanitizers settle.
-/// Native events emitted later by a JavaScript subscriber are separate publications and may
-/// require another flush after the JavaScript callback runs.
+/// Awaiting this Promise does not block the Node event loop while Promise-returning event
+/// sanitizers settle or queued JavaScript subscriber callbacks run. Native events emitted by a
+/// JavaScript subscriber are separate publications and may require another flush.
 ///
 /// The Promise rejects if the blocking task fails or the core subscriber flush returns an error.
 /// Callers should handle errors when awaiting it.
@@ -3335,10 +3458,13 @@ pub fn flush_subscribers(env: Env) -> Result<JsObject> {
             if reentrant {
                 return Ok(());
             }
-            tokio::task::spawn_blocking(core_subscriber_api::flush_subscribers)
-                .await
-                .map_err(|error| to_napi_err(FlowError::Internal(error.to_string())))?
-                .map_err(to_napi_err)
+            tokio::task::spawn_blocking(|| {
+                core_subscriber_api::flush_subscribers()?;
+                callable::flush_js_subscriber_callbacks()
+            })
+            .await
+            .map_err(|error| to_napi_err(FlowError::Internal(error.to_string())))?
+            .map_err(to_napi_err)
         },
         |env, _| env.get_undefined(),
     )
@@ -3355,8 +3481,9 @@ macro_rules! napi_scope_event_guardrail_api {
         /// The callback may return fields directly or in a Promise. Scope and mark
         /// calls queue the event and return synchronously; publication resumes after
         /// the Promise settles. Callback, serialization, conversion, or invalid-result
-        /// failures preserve the last valid event fields and record the error for
-        /// `getLastCallbackError()`.
+        /// failures clear the emitted event fields and record the error for
+        /// `getLastCallbackError()`. Await `flushSubscribers()` before inspecting
+        /// either the delivered event or that error.
         #[napi]
         pub fn $register_name(
             env: Env,
@@ -3451,7 +3578,7 @@ napi_scope_guardrail_tool_api!(
     /// The `guardrail` callback receives `(toolName, args)` and must return sanitized args.
     /// Higher `priority` values run first. Throws if a guardrail with the same `name` already exists
     /// on the specified scope.
-    /// If the callback throws, Relay preserves the current emitted payload and records the error
+    /// If the callback throws, Relay omits the emitted payload and records the error
     /// for `getLastCallbackError()`.
     scope_register_tool_sanitize_request_guardrail,
     /// Deregister a scope-local tool request sanitization guardrail by name.
@@ -3469,7 +3596,7 @@ napi_scope_guardrail_tool_api!(
     /// The `guardrail` callback receives `(toolName, result)` and must return sanitized result.
     /// Higher `priority` values run first. Throws if a guardrail with the same `name` already exists
     /// on the specified scope.
-    /// If the callback throws, Relay preserves the current emitted payload and records the error
+    /// If the callback throws, Relay omits the emitted payload and records the error
     /// for `getLastCallbackError()`.
     scope_register_tool_sanitize_response_guardrail,
     /// Deregister a scope-local tool response sanitization guardrail by name.
@@ -3604,7 +3731,7 @@ pub fn scope_register_tool_execution_intercept(
     name: String,
     priority: i32,
     #[napi(
-        ts_arg_type = "(args: Json, next: (args: Json) => Json | Promise<Json>) => { result: Json; pendingMarks?: Array<{ name: string; category?: string | null; categoryProfile?: Json; data?: Json; metadata?: Json }> } | Promise<{ result: Json; pendingMarks?: Array<{ name: string; category?: string | null; categoryProfile?: Json; data?: Json; metadata?: Json }> }>"
+        ts_arg_type = "(args: Json, next: (args: Json) => ToolExecutionResult | Promise<ToolExecutionResult>) => { result: Json; annotation?: Json; pendingMarks?: Array<{ name: string; category?: string | null; categoryProfile?: Json; data?: Json; metadata?: Json }> } | Promise<{ result: Json; annotation?: Json; pendingMarks?: Array<{ name: string; category?: string | null; categoryProfile?: Json; data?: Json; metadata?: Json }> }>"
     )]
     callable: JsFunction,
 ) -> Result<()> {
@@ -3644,7 +3771,7 @@ pub fn scope_deregister_tool_execution_intercept(scope_uuid: String, name: Strin
 /// The `guardrail` callback receives `(request, context)` and must return the sanitized request,
 /// or `null` to omit the observability payload. Lower `priority` values run first. Throws if a
 /// guardrail with the same `name` already exists on the specified scope. If the callback throws,
-/// Relay preserves the last valid payload, continues publication, and records the error for
+/// Relay omits the payload and annotation, continues publication, and records the error for
 /// `getLastCallbackError()`.
 #[napi]
 pub fn scope_register_llm_sanitize_request_guardrail(
@@ -3689,7 +3816,7 @@ pub fn scope_deregister_llm_sanitize_request_guardrail(
 /// The `guardrail` callback receives `(response, context)` and must return the sanitized response,
 /// or `null` to omit the observability payload. Lower `priority` values run first. Throws if a
 /// guardrail with the same `name` already exists on the specified scope. If the callback throws,
-/// Relay preserves the last valid payload, continues publication, and records the error for
+/// Relay omits the payload and annotation, continues publication, and records the error for
 /// `getLastCallbackError()`.
 #[napi]
 pub fn scope_register_llm_sanitize_response_guardrail(
@@ -3924,23 +4051,22 @@ pub fn scope_deregister_llm_stream_execution_intercept(
 /// Register a scope-local named event subscriber that receives lifecycle events
 /// for the specified scope.
 ///
-/// The `callback` receives each event as the canonical JSON event object. Events are
-/// delivered asynchronously and non-blocking. Throws if a subscriber with the same `name`
-/// already exists on the specified scope.
+/// The `callback` receives each event as the canonical JSON event object and may return a
+/// Promise. Events are delivered asynchronously and non-blocking. Callback failures are
+/// isolated, reported to stderr and `getLastCallbackError()`, and do not reject
+/// `flushSubscribers()`. Throws if a subscriber with the same `name` already exists on the
+/// specified scope.
 #[napi]
 pub fn scope_register_subscriber(
+    env: Env,
     scope_uuid: String,
     name: String,
-    callback: ThreadsafeFunction<Json, ErrorStrategy::Fatal>,
+    #[napi(ts_arg_type = "(event: Json) => void | Promise<void>")] callback: JsFunction,
 ) -> Result<()> {
     let uuid = uuid::Uuid::parse_str(&scope_uuid)
         .map_err(|e| napi::Error::from_reason(format!("invalid UUID: {e}")))?;
-    core_subscriber_api::scope_register_subscriber(
-        &uuid,
-        &name,
-        callable::wrap_js_event_subscriber(callback),
-    )
-    .map_err(to_napi_err)
+    let callback = callable::wrap_js_event_subscriber(&env, name.clone(), callback)?;
+    core_subscriber_api::scope_register_subscriber(&uuid, &name, callback).map_err(to_napi_err)
 }
 
 /// Deregister a scope-local event subscriber by name.
@@ -4709,8 +4835,21 @@ pub fn register_plugin(
     validate: Option<JsFunction>,
     register: JsFunction,
 ) -> napi::Result<()> {
-    let validate_tsfn = match validate {
-        Some(func) => Some(PersistentJsFunction::new(&env, &func)?),
+    let validate_callback = match validate {
+        Some(func) => {
+            let direct = PersistentJsFunction::new(&env, &func)?;
+            let callback = callable::safe_middleware_callback(&env, &func)?;
+            let mut thread_safe = callback.create_threadsafe_function(
+                0,
+                |ctx: napi::threadsafe_function::ThreadSafeCallContext<Json>| Ok(vec![ctx.value]),
+            )?;
+            thread_safe.unref(&env)?;
+            Some(NodePluginValidateCallback {
+                direct,
+                thread_safe,
+                registration_thread: std::thread::current().id(),
+            })
+        }
         None => None,
     };
     let mut register_tsfn = register
@@ -4738,7 +4877,7 @@ pub fn register_plugin(
 
     register_plugin_impl(Arc::new(NodePlugin {
         plugin_kind,
-        validate: validate_tsfn,
+        validate: validate_callback,
         register: register_tsfn,
     }))
     .map_err(|e| napi::Error::from_reason(e.to_string()))
@@ -5009,7 +5148,7 @@ pub fn clear_plugin_configuration() -> napi::Result<()> {
     clear_plugin_configuration_impl().map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
-/// Return the last successfully configured plugin report.
+/// Return the active plugin report or one retained after a teardown failure with runtime diagnostics.
 #[napi]
 pub fn active_plugin_report() -> napi::Result<Option<Json>> {
     active_plugin_report_impl()

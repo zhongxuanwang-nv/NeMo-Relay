@@ -321,9 +321,10 @@ the rest of the documentation can use them consistently.
   Dynamic Plugins](/build-plugins/dynamic-plugins/native-dynamic/about).
 
 **NeMo Guardrails**
-: NeMo Guardrails is the built-in `nemo_guardrails` plugin component for
-  first-party guardrail policy around managed tool and LLM execution. It
-  supports remote Guardrails-service and Python-backed local backends.
+: NeMo Guardrails is the deprecated built-in `nemo_guardrails` plugin component
+  for first-party guardrail policy around managed tool and LLM execution. It
+  supports remote Guardrails-service and Python-backed local backends and is
+  scheduled for removal in NeMo Relay 0.9.
 
 **Next Function**
 : The next function is the continuation passed to an execution intercept. The
@@ -518,6 +519,13 @@ the rest of the documentation can use them consistently.
   operation. Managed tool calls emit start and end events, run tool middleware,
   and can carry an optional provider-specific `tool_call_id`.
 
+**Tool Execution Result**
+: A tool execution result is the canonical `{result, annotation?}` value
+  returned by managed tool callbacks, execution-intercept continuations, and
+  execute helpers. `result` is the application-owned payload. `annotation` is
+  optional opaque JSON metadata that Relay transports without interpreting its
+  schema.
+
 **Tool Parallelism**
 : Tool parallelism is adaptive guidance about which tool calls can run
   concurrently or be scheduled differently based on observed dependency
@@ -528,7 +536,7 @@ the rest of the documentation can use them consistently.
 : A trace span is a timed observability record in a tracing backend. Exported
   NeMo Relay scopes, tool calls, LLM calls, and marks appear as spans when using
   a compatible OpenTelemetry projection. The `gen_ai` projection omits marks
-  and unsupported scope types.
+  and emits minimal internal spans for scopes without GenAI semantics.
 
 **Trajectory**
 : A trajectory is an ordered record of an agent run. In ATIF export, LLM events

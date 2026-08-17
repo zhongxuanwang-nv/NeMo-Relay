@@ -3,6 +3,9 @@
 
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use crate::api::event::{BaseEvent, MarkEvent};
 use crate::api::optimization::{
     LlmOptimizationRecorder, record_llm_optimization_contribution, scope_llm_optimization_recorder,
@@ -11,21 +14,25 @@ use crate::api::runtime::{
     BuiltinLlmCodec, LlmCodecIdentity, LlmSanitizeRequestContext, LlmSanitizeResponseContext,
     MiddlewareContinuationLease, NemoRelayContextState,
 };
+use crate::api::tool::ToolExecutionResult;
 use crate::codec::openai_chat::OpenAIChatCodec;
 use crate::codec::optimization::LlmOptimizationContribution;
 use crate::codec::traits::{LlmCodec, LlmResponseCodec};
-use nemo_relay_worker_proto::json_envelope;
 use nemo_relay_worker_proto::v1::invoke_response::Result as InvokeResult;
 use nemo_relay_worker_proto::v1::plugin_worker_server::{PluginWorker, PluginWorkerServer};
 use nemo_relay_worker_proto::v1::stream_chunk::Item as StreamItem;
 use nemo_relay_worker_proto::v1::{
     CancelInvocationRequest, CreateScopeStackRequest, DropScopeStackRequest, EmitMarkRequest,
     EmptyResult, GuardrailResult, HandshakeRequest, HandshakeResponse, HealthRequest,
-    HealthResponse, JsonEnvelope, JsonResult, LlmCodecDecodeRequest, LlmCodecDecodeResponse,
-    LlmCodecEncodeRequest, LlmNextRequest, LlmRequestInterceptResult, LlmStreamNextRequest,
-    PopScopeRequest, PushScopeRequest, Registration, ScopeContext, ScopeType as ProtoScopeType,
-    ShutdownRequest, StreamChunk, ToolNextRequest, ValidateRequest, ValidateResponse, WorkerAck,
+    HealthResponse, JsonEnvelope, JsonResult, JsonValue, LlmCodecDecodeRequest,
+    LlmCodecDecodeResponse, LlmCodecEncodeRequest, LlmNextRequest, LlmRequestInterceptResult,
+    LlmStreamNextRequest, PopScopeRequest, PushScopeRequest, Registration, ScopeContext,
+    ScopeType as ProtoScopeType, ShutdownRequest, StreamChunk,
+    ToolExecutionInterceptOutcome as ProtoToolExecutionInterceptOutcome,
+    ToolExecutionInterceptResult, ToolExecutionResultResponse, ToolNextRequest, ValidateRequest,
+    ValidateResponse, WorkerAck,
 };
+use nemo_relay_worker_proto::{decode_json_value, json_envelope};
 use serde_json::json;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -119,11 +126,78 @@ fn python_worker_launch_clears_host_python_environment() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn python_worker_process_launch_uses_the_managed_interpreter_and_endpoint_file() {
+    let plugin_id = "acme.python.launch";
+    let digest = Sha256::digest(plugin_id.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let temp = tempfile::tempdir().unwrap();
+    let managed = temp.path().join(MANAGED_ENVIRONMENTS_DIR).join(digest);
+    let interpreter = managed.join("bin/python");
+    std::fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+    let probe = temp.path().join("launch-probe");
+    std::fs::write(
+        &interpreter,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n%s\\n' \"$0\" \"$NEMO_RELAY_WORKER_ENDPOINT_FILE\" > '{}'\nexit 0\n",
+            probe.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&interpreter).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&interpreter, permissions).unwrap();
+
+    let endpoint_file = temp.path().join("worker-endpoint");
+    let mut child = spawn_worker_process(WorkerProcessLaunch {
+        runtime: WorkerRuntime::Python,
+        manifest_path: &temp.path().join("plugin.toml"),
+        environment_ref: managed.to_str(),
+        plugin_id,
+        entrypoint: "acme_worker:create_plugin",
+        activation_id: "activation",
+        auth_token: "token",
+        host_endpoint: "http://127.0.0.1:1",
+        worker_endpoint: "http://127.0.0.1:2",
+        worker_endpoint_file: Some(&endpoint_file),
+    })
+    .unwrap();
+    assert!(child.wait().unwrap().success());
+    let recorded = std::fs::read_to_string(&probe).unwrap();
+    let mut lines = recorded.lines();
+    assert_eq!(lines.next(), interpreter.to_str());
+    assert_eq!(lines.next(), endpoint_file.to_str());
+    assert_eq!(lines.next(), None);
+}
+
 #[cfg(not(unix))]
 #[test]
 fn empty_worker_endpoint_announcement_is_retried() {
     let temp = tempfile::tempdir().unwrap();
     let announcement = temp.path().join("worker-endpoint");
+    let missing = temp.path().join("missing-endpoint");
+    let directory = temp.path().join("endpoint-directory");
+    std::fs::create_dir(&directory).unwrap();
+
+    assert_eq!(
+        normalize_worker_tcp_endpoint(" tcp://127.0.0.1:50051 ").unwrap(),
+        "http://127.0.0.1:50051"
+    );
+    assert_eq!(
+        normalize_worker_tcp_endpoint("http://127.0.0.1:50051").unwrap(),
+        "http://127.0.0.1:50051"
+    );
+    assert!(normalize_worker_tcp_endpoint("tcp://").is_err());
+    assert!(normalize_worker_tcp_endpoint("https://127.0.0.1").is_err());
+    assert!(
+        resolve_worker_connect_endpoint(&WorkerConnectEndpoint::Announced(missing))
+            .unwrap()
+            .is_none()
+    );
+    assert!(resolve_worker_connect_endpoint(&WorkerConnectEndpoint::Announced(directory)).is_err());
     std::fs::write(&announcement, "").unwrap();
 
     let endpoint = WorkerConnectEndpoint::Announced(announcement);
@@ -135,14 +209,50 @@ fn empty_worker_endpoint_announcement_is_retried() {
     );
 }
 
-#[test]
-fn response_helpers_cover_error_and_unexpected_shapes() {
-    enable_operational_logs();
-    let worker_error = WorkerError {
+fn test_worker_error() -> WorkerError {
+    WorkerError {
         code: "worker.failed".into(),
         message: "boom".into(),
         retryable: false,
-    };
+    }
+}
+
+#[test]
+fn worker_protocol_error_and_json_helpers_preserve_failure_semantics() {
+    let error = test_worker_error();
+    assert!(matches!(
+        worker_error_to_flow(error.clone()),
+        FlowError::Internal(message) if message.contains("worker.failed")
+    ));
+    assert!(matches!(
+        worker_error_to_plugin(error, "fallback"),
+        PluginError::RegistrationFailed(message) if message.contains("worker.failed")
+    ));
+    assert_eq!(
+        json_from_invoke_response(InvokeResponse {
+            result: Some(InvokeResult::Json(JsonResult {
+                value: Some(JsonEnvelope {
+                    schema: "test".into(),
+                    json: b"{\"ok\":true}".to_vec(),
+                }),
+                error: None,
+            })),
+        })
+        .unwrap(),
+        serde_json::json!({"ok": true})
+    );
+    assert!(
+        json_from_invoke_response(InvokeResponse {
+            result: Some(InvokeResult::Error(test_worker_error())),
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn response_helpers_cover_json_and_guardrail_error_shapes() {
+    enable_operational_logs();
+    let worker_error = test_worker_error();
 
     let error = json_from_invoke_response(InvokeResponse {
         result: Some(InvokeResult::Json(JsonResult {
@@ -211,6 +321,12 @@ fn response_helpers_cover_error_and_unexpected_shapes() {
         .to_string()
         .contains("guardrail returned unexpected")
     );
+}
+
+#[test]
+fn response_helpers_cover_stream_optional_and_cancellation_errors() {
+    enable_operational_logs();
+    let worker_error = test_worker_error();
 
     assert!(
         json_from_stream_chunk(StreamChunk {
@@ -236,6 +352,74 @@ fn response_helpers_cover_error_and_unexpected_shapes() {
             .expect_err("empty stream chunk should fail")
             .to_string()
             .contains("stream chunk was empty")
+    );
+
+    assert!(
+        optional_json_from_invoke_response(InvokeResponse {
+            result: Some(InvokeResult::Json(JsonResult {
+                value: None,
+                error: Some(worker_error.clone()),
+            })),
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("worker.failed")
+    );
+    assert!(
+        optional_json_from_invoke_response(InvokeResponse {
+            result: Some(InvokeResult::Json(JsonResult {
+                value: Some(JsonEnvelope {
+                    schema: JSON_SCHEMA.into(),
+                    json: b"{".to_vec(),
+                }),
+                error: None,
+            })),
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("invalid JSON result")
+    );
+    assert_eq!(
+        optional_json_from_invoke_response(InvokeResponse {
+            result: Some(InvokeResult::Empty(EmptyResult {})),
+        })
+        .expect("empty result must map to no replacement JSON"),
+        None
+    );
+    assert!(
+        optional_json_from_invoke_response(InvokeResponse {
+            result: Some(InvokeResult::Guardrail(GuardrailResult {
+                block_reason: String::new(),
+            })),
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("unexpected LLM sanitizer result")
+    );
+
+    let typed_error = typed_json_result::<Json>(
+        JSON_SCHEMA,
+        Err(FlowError::Internal("typed result failed".into())),
+    );
+    assert!(typed_error.value.is_none());
+    assert!(
+        typed_error
+            .error
+            .is_some_and(|error| error.message.contains("typed result failed"))
+    );
+    assert!(
+        worker_error_to_flow(WorkerError {
+            code: "worker.cancelled".into(),
+            message: "cancelled by caller".into(),
+            retryable: false,
+        })
+        .to_string()
+        .contains("worker invocation cancelled")
+    );
+    assert!(
+        worker_status_to_flow("unused", Status::cancelled("cancelled by transport"))
+            .to_string()
+            .contains("worker invocation cancelled")
     );
 }
 
@@ -401,6 +585,33 @@ fn relay_compatibility_and_blocking_helpers_cover_local_edges() {
 }
 
 #[test]
+fn worker_handshake_validation_accepts_v1_and_rejects_v2() {
+    let mut handshake = HandshakeResponse {
+        plugin_id: "fixture_worker".into(),
+        plugin_kind: "fixture_worker".into(),
+        allows_multiple_components: false,
+        worker_protocol: "grpc-v2".into(),
+        sdk_name: "unit".into(),
+        sdk_version: "0".into(),
+        runtime_name: "unit".into(),
+        runtime_version: "0".into(),
+        supported_surfaces: Vec::new(),
+    };
+
+    let error = validate_worker_handshake("fixture_worker", &handshake)
+        .expect_err("a grpc-v2 handshake response must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported worker_protocol 'grpc-v2'")
+    );
+
+    handshake.worker_protocol = WORKER_PROTOCOL_GRPC_V1.into();
+    validate_worker_handshake("fixture_worker", &handshake)
+        .expect("a grpc-v1 handshake response should be accepted");
+}
+
+#[test]
 #[cfg(unix)]
 fn worker_endpoints_fail_when_host_socket_cannot_bind() {
     enable_operational_logs();
@@ -419,6 +630,16 @@ fn worker_endpoints_fail_when_host_socket_cannot_bind() {
     );
 
     let _ = std::fs::remove_dir_all(&activation_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn worker_unix_connection_reports_a_missing_socket() {
+    let missing = std::env::temp_dir().join(format!("nmrw-missing-{}", Uuid::now_v7()));
+    let error = connect_worker(&WorkerConnectEndpoint::Unix(missing.clone()))
+        .await
+        .expect_err("a missing worker socket should fail to connect");
+    assert!(error.to_string().contains(&missing.display().to_string()));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -478,6 +699,26 @@ async fn callback_helpers_cover_worker_response_edges() {
             },
             "llm_intercept_error" => InvokeResponse {
                 result: Some(InvokeResult::Error(worker_error.clone())),
+            },
+            "tool_intercept_missing_result" => InvokeResponse {
+                result: Some(InvokeResult::ToolExecution(ToolExecutionInterceptResult {
+                    outcome: Some(ProtoToolExecutionInterceptOutcome {
+                        result: None,
+                        annotation: None,
+                        pending_marks: None,
+                    }),
+                })),
+            },
+            "tool_intercept_invalid_result" => InvokeResponse {
+                result: Some(InvokeResult::ToolExecution(ToolExecutionInterceptResult {
+                    outcome: Some(ProtoToolExecutionInterceptOutcome {
+                        result: Some(JsonValue {
+                            json: b"{".to_vec(),
+                        }),
+                        annotation: None,
+                        pending_marks: None,
+                    }),
+                })),
             },
             _ => InvokeResponse {
                 result: Some(InvokeResult::Empty(EmptyResult {})),
@@ -575,6 +816,36 @@ async fn callback_helpers_cover_worker_response_edges() {
         .await
         .expect_err("LLM intercept worker error should surface");
     assert!(error.to_string().contains("worker.failed: boom"));
+
+    let error = callback
+        .invoke_tool_execution(
+            "tool_intercept_missing_result",
+            "lookup",
+            json!({}),
+            Arc::new(|args| Box::pin(async move { Ok(ToolExecutionResult::new(args)) })),
+        )
+        .await
+        .expect_err("tool outcome without its required result should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("tool execution intercept outcome result is missing")
+    );
+
+    let error = callback
+        .invoke_tool_execution(
+            "tool_intercept_invalid_result",
+            "lookup",
+            json!({}),
+            Arc::new(|args| Box::pin(async move { Ok(ToolExecutionResult::new(args)) })),
+        )
+        .await
+        .expect_err("tool outcome with invalid result JSON should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("invalid worker tool execution result JSON")
+    );
 
     let error = callback
         .invoke_llm_request_intercept(
@@ -1110,7 +1381,7 @@ async fn dropping_callback_future_cancels_worker_and_cleans_host_state() {
     let continuation_id = callback
         .host_state
         .insert_continuation(Continuation::tool(Arc::new(|value| {
-            Box::pin(async move { Ok(value) })
+            Box::pin(async move { Ok(ToolExecutionResult::new(value)) })
         })))
         .expect("continuation should insert");
     let request = callback.base_request(
@@ -1574,8 +1845,8 @@ async fn installed_callbacks_apply_surface_specific_fallbacks() {
     for entries in [mark_entries, scope_start_entries, scope_end_entries] {
         let sanitized =
             NemoRelayContextState::event_sanitize_snapshot_chain(event.clone(), &entries).await;
-        assert_eq!(sanitized.data(), event.data());
-        assert_eq!(sanitized.metadata(), event.metadata());
+        assert_eq!(sanitized.data(), None);
+        assert_eq!(sanitized.metadata(), None);
     }
 
     assert_eq!(
@@ -1585,7 +1856,7 @@ async fn installed_callbacks_apply_surface_specific_fallbacks() {
             &tool_request_entries,
         )
         .await,
-        tool_request
+        None
     );
     assert_eq!(
         NemoRelayContextState::tool_sanitize_response_snapshot_chain(
@@ -1594,7 +1865,7 @@ async fn installed_callbacks_apply_surface_specific_fallbacks() {
             &tool_response_entries,
         )
         .await,
-        tool_response
+        None
     );
     assert_eq!(
         NemoRelayContextState::llm_sanitize_request_snapshot_chain(
@@ -1603,7 +1874,7 @@ async fn installed_callbacks_apply_surface_specific_fallbacks() {
             &llm_request_entries,
         )
         .await,
-        Some(llm_request),
+        None,
     );
     assert_eq!(
         NemoRelayContextState::llm_sanitize_response_snapshot_chain(
@@ -1612,7 +1883,7 @@ async fn installed_callbacks_apply_surface_specific_fallbacks() {
             &llm_response_entries,
         )
         .await,
-        Some(llm_response),
+        None,
     );
     crate::api::subscriber::flush_subscribers().expect("subscriber callback should flush");
 }
@@ -1852,6 +2123,18 @@ async fn host_runtime_codec_capabilities_are_directional_authorized_and_ephemera
         .expect_err("a capability cannot be reused by another invocation");
     assert_eq!(wrong_invocation.code(), tonic::Code::PermissionDenied);
 
+    let wrong_invocation = state
+        .response_codec(&response_capability, "another-invocation")
+        .err()
+        .expect("response capability must remain invocation-bound");
+    assert_eq!(wrong_invocation.code(), tonic::Code::PermissionDenied);
+
+    let wrong_direction = state
+        .response_codec(&request_capability, invocation_id)
+        .err()
+        .expect("request capability cannot decode responses");
+    assert_eq!(wrong_direction.code(), tonic::Code::InvalidArgument);
+
     let decoded = service
         .decode_llm_codec_request(Request::new(LlmCodecDecodeRequest {
             activation_id: ACTIVATION_ID.into(),
@@ -2038,7 +2321,7 @@ async fn host_runtime_service_covers_continuation_errors_and_stream_items() {
 
     let tool_continuation = state
         .insert_continuation(Continuation::tool(Arc::new(|value| {
-            Box::pin(async move { Ok(value) })
+            Box::pin(async move { Ok(ToolExecutionResult::new(value)) })
         })))
         .expect("tool continuation should insert");
     let invalid_tool_json = service
@@ -2251,7 +2534,7 @@ async fn worker_continuations_reject_calls_after_the_interceptor_settles() {
                     invocation?
                         .invoke(|| async move {
                             provider_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            Ok(value)
+                            Ok(ToolExecutionResult::new(value))
                         })
                         .await
                 })
@@ -2330,9 +2613,9 @@ async fn worker_continuations_use_the_scope_stack_selected_for_each_call() {
     let continuation_id = state
         .insert_continuation(Continuation::tool(Arc::new(|_| {
             Box::pin(async {
-                Ok(json!(
+                Ok(ToolExecutionResult::new(json!(
                     crate::api::runtime::task_scope_top().uuid.to_string()
-                ))
+                )))
             })
         })))
         .expect("tool continuation should insert");
@@ -2353,14 +2636,12 @@ async fn worker_continuations_use_the_scope_stack_selected_for_each_call() {
         service.tool_next(request("worker-next-first")),
         service.tool_next(request("worker-next-second"))
     );
-    let decode = |response: tonic::Response<JsonResult>| {
-        decode_json_envelope::<Json>(
-            &response
-                .into_inner()
-                .value
-                .expect("tool next should return a value"),
-        )
-        .unwrap()
+    let decode = |response: tonic::Response<ToolExecutionResultResponse>| {
+        let value = response
+            .into_inner()
+            .value
+            .expect("tool next should return a value");
+        decode_json_value::<Json>(value.result.as_ref().expect("tool next result")).unwrap()
     };
 
     assert_eq!(decode(first.unwrap()), json!(expected[0]));
@@ -2527,6 +2808,13 @@ fn registration(surface: RegistrationSurface, local_name: &str) -> Registration 
         priority: 0,
         break_chain: false,
     }
+}
+
+#[test]
+fn worker_loader_empty_input_returns_an_empty_activation() {
+    let activation = load_worker_plugins(Vec::<WorkerPluginLoadSpec>::new()).unwrap();
+    assert!(activation.is_empty());
+    activation.clear();
 }
 
 fn poison_mutex(f: impl FnOnce() + std::panic::UnwindSafe) {

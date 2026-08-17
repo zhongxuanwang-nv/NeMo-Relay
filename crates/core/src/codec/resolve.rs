@@ -14,7 +14,7 @@ use super::request::AnnotatedLlmRequest;
 use super::response::AnnotatedLlmResponse;
 use super::streaming::StreamingCodec;
 use super::traits::{LlmCodec, LlmResponseCodec};
-use super::{anthropic, openai_chat, openai_responses};
+use super::{anthropic, gemini_generate_content, oci_genai, openai_chat, openai_responses};
 
 /// A built-in provider request/response surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +25,10 @@ pub enum ProviderSurface {
     OpenAIResponses,
     /// Anthropic Messages.
     AnthropicMessages,
+    /// OCI Generative AI chat.
+    OCIGenAI,
+    /// Gemini generateContent.
+    GeminiGenerateContent,
 }
 
 /// Request shape detector; the optional `&str` is a provider hint a codec may use
@@ -66,16 +70,21 @@ pub(crate) struct ProviderSurfaceDescriptor {
 pub(crate) static BUILTIN_PROVIDER_SURFACES: &[ProviderSurfaceDescriptor] = &[
     openai_responses::PROVIDER_SURFACE,
     anthropic::PROVIDER_SURFACE,
+    // OCI GenAI must precede OpenAI Chat: a bare OCI GENERIC chatRequest body
+    // carries `messages`, which the looser OpenAI Chat detector would claim
+    // under first-match-wins. It has no overlap with the surfaces above.
+    oci_genai::PROVIDER_SURFACE,
     openai_chat::PROVIDER_SURFACE,
+    gemini_generate_content::PROVIDER_SURFACE,
 ];
 
 /// Detect the request surface from a raw request body by top-level key.
 ///
 /// Priority: OpenAI Responses (`input`/`instructions`) > Anthropic Messages
-/// (`system`) > OpenAI Chat (`messages`). `None` when no key matches or `body`
-/// is not an object. This is a best-effort heuristic: an Anthropic request that
-/// omits the optional top-level `system` is indistinguishable from OpenAI Chat
-/// and classifies as `OpenAIChat`.
+/// (`system`) > OpenAI Chat (`messages`) > Gemini generateContent (`contents`).
+/// `None` when no key matches or `body` is not an object. This is a best-effort heuristic: an
+/// Anthropic request that omits the optional top-level `system` is
+/// indistinguishable from OpenAI Chat and classifies as `OpenAIChat`.
 #[must_use]
 pub fn detect_request_surface(body: &Json) -> Option<ProviderSurface> {
     detect_request_surface_with_hint(body, None)
@@ -152,19 +161,20 @@ fn descriptor_for(surface: ProviderSurface) -> &'static ProviderSurfaceDescripto
         ProviderSurface::OpenAIChat => &openai_chat::PROVIDER_SURFACE,
         ProviderSurface::OpenAIResponses => &openai_responses::PROVIDER_SURFACE,
         ProviderSurface::AnthropicMessages => &anthropic::PROVIDER_SURFACE,
+        ProviderSurface::OCIGenAI => &oci_genai::PROVIDER_SURFACE,
+        ProviderSurface::GeminiGenerateContent => &gemini_generate_content::PROVIDER_SURFACE,
     }
 }
 
 impl ProviderSurface {
-    /// The canonical codec name for this surface (e.g. `"openai_chat"`), the
-    /// inverse of [`Self::from_codec_name`].
+    /// The canonical codec name for this surface (e.g. `"openai_chat"`).
     #[must_use]
     pub fn codec_name(self) -> &'static str {
         descriptor_for(self).codec_name
     }
 
-    /// Resolves a canonical codec name to its surface, or `None` when `name` is
-    /// not a built-in provider codec.
+    /// Resolves a canonical codec name to its surface, or `None` when `name`
+    /// is not a built-in provider codec.
     #[must_use]
     pub fn from_codec_name(name: &str) -> Option<Self> {
         BUILTIN_PROVIDER_SURFACES

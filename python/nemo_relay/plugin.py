@@ -10,8 +10,14 @@ per component by the runtime, so end users do not provide instance ids.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import os
+import tomllib
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, fields, is_dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, AsyncIterator, Callable, Literal, Protocol, Self, TypedDict, cast
 
 from nemo_relay import (
@@ -37,6 +43,9 @@ from nemo_relay._native import (
 )
 from nemo_relay._native import (
     clear_plugin_configuration as _clear_plugin_configuration,
+)
+from nemo_relay._native import (
+    clear_plugin_configuration_async as _clear_plugin_configuration_async,
 )
 from nemo_relay._native import (
     deregister_plugin as _deregister_plugin,
@@ -76,10 +85,25 @@ class ConfigDiagnostic(_ConfigDiagnosticRequired, total=False):
     field: str
 
 
+class _RuntimeDiagnosticRequired(TypedDict):
+    code: str
+    component: str
+    message: str
+    count: int
+
+
+class RuntimeDiagnostic(_RuntimeDiagnosticRequired, total=False):
+    """One aggregated runtime failure from an active plugin."""
+
+    field: str
+    session_id: str
+
+
 class ConfigReport(TypedDict):
     """Validation or activation report for a plugin config."""
 
     diagnostics: list[ConfigDiagnostic]
+    runtime_diagnostics: list[RuntimeDiagnostic]
 
 
 DynamicPluginKind = Literal["rust_dynamic", "worker"]
@@ -398,6 +422,112 @@ class PluginHostActivation:
         await self.close()
 
 
+def load_dynamic_plugin_activation_specs(
+    plugin_config_path: str | os.PathLike[str],
+) -> list[DynamicPluginActivationSpec]:
+    """Load dynamic activation specs from one standard ``plugins.toml``.
+
+    Args:
+        plugin_config_path: Explicit path to the ``plugins.toml`` file.
+
+    Returns:
+        Activation specs for every ``[[plugins.dynamic]]`` record, in file
+        order. Manifest paths are resolved relative to ``plugins.toml`` and
+        each plugin's identifier and execution lane come from its manifest.
+
+    Behavior:
+        This 0.7 compatibility helper parses one explicit file only. It does
+        not perform standard discovery, inspect CLI lifecycle state, provision
+        worker environments, change enablement, or activate plugins. It is
+        planned for deprecation after a unified file-backed initializer is
+        available. Keep its use localized and pass the result to
+        :func:`initialize_with_dynamic_plugins`.
+    """
+    source = Path(os.fspath(plugin_config_path)).resolve()
+    document = _load_plugin_toml(source, "plugin TOML")
+    version = document.get("version", 1)
+    if not isinstance(version, int) or isinstance(version, bool) or version != 1:
+        raise ValueError(f"plugin config version {version!r} in {source} is unsupported; expected 1")
+    plugins = document.get("plugins", {})
+    if not isinstance(plugins, dict):
+        raise ValueError(f"invalid dynamic plugin config in {source}: 'plugins' must be a table")
+    plugins = cast(dict[str, object], plugins)
+    dynamic_plugins = plugins.get("dynamic", [])
+    if not isinstance(dynamic_plugins, list):
+        raise ValueError(f"invalid dynamic plugin config in {source}: 'plugins.dynamic' must be an array of tables")
+
+    specs: list[DynamicPluginActivationSpec] = []
+    seen_plugin_ids: set[str] = set()
+    for index, entry in enumerate(dynamic_plugins):
+        spec = _dynamic_plugin_spec(source, index, entry)
+        if spec.plugin_id in seen_plugin_ids:
+            raise ValueError(f"duplicate dynamic plugin id {spec.plugin_id!r} in {source}")
+        seen_plugin_ids.add(spec.plugin_id)
+        specs.append(spec)
+    return specs
+
+
+def _dynamic_plugin_spec(source: Path, index: int, entry: object) -> DynamicPluginActivationSpec:
+    if not isinstance(entry, dict):
+        raise ValueError(f"invalid dynamic plugin config in {source}: plugins.dynamic[{index}] must be a table")
+    entry = cast(dict[str, object], entry)
+    unknown_fields = sorted(set(entry) - {"manifest", "config"})
+    if unknown_fields:
+        raise ValueError(
+            f"invalid dynamic plugin config in {source}: plugins.dynamic[{index}] has unknown fields: "
+            + ", ".join(unknown_fields)
+        )
+    manifest_path = _dynamic_manifest_path(source, index, entry.get("manifest"))
+    plugin_id, kind = _dynamic_manifest_identity(manifest_path)
+    config = _dynamic_plugin_config(source, index, entry.get("config", {}))
+    return DynamicPluginActivationSpec(plugin_id=plugin_id, kind=kind, manifest_ref=str(manifest_path), config=config)
+
+
+def _dynamic_manifest_path(source: Path, index: int, manifest_ref: object) -> Path:
+    if not isinstance(manifest_ref, str) or not manifest_ref.strip():
+        raise ValueError(
+            f"invalid dynamic plugin config in {source}: plugins.dynamic[{index}].manifest must be a non-empty string"
+        )
+    path = Path(manifest_ref)
+    return (path if path.is_absolute() else source.parent / path).resolve()
+
+
+def _dynamic_manifest_identity(manifest_path: Path) -> tuple[str, DynamicPluginKind]:
+    identity = _load_plugin_toml(manifest_path, "dynamic plugin manifest").get("plugin")
+    if not isinstance(identity, dict):
+        raise ValueError(f"invalid dynamic plugin manifest in {manifest_path}: 'plugin' must be a table")
+    identity = cast(dict[str, object], identity)
+    plugin_id = identity.get("id")
+    if not isinstance(plugin_id, str) or not plugin_id.strip():
+        raise ValueError(f"invalid dynamic plugin manifest in {manifest_path}: 'plugin.id' must be a non-empty string")
+    kind = identity.get("kind")
+    if kind not in ("rust_dynamic", "worker"):
+        raise ValueError(
+            f"invalid dynamic plugin manifest in {manifest_path}: 'plugin.kind' must be 'rust_dynamic' or 'worker'"
+        )
+    return plugin_id.strip(), cast(DynamicPluginKind, kind)
+
+
+def _dynamic_plugin_config(source: Path, index: int, config: object) -> JsonObject:
+    if not isinstance(config, dict):
+        raise ValueError(f"invalid dynamic plugin config in {source}: plugins.dynamic[{index}].config must be a table")
+    try:
+        return cast(JsonObject, json.loads(json.dumps(config, allow_nan=False)))
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"invalid dynamic plugin config in {source}: "
+            f"plugins.dynamic[{index}].config must contain JSON values: {error}"
+        ) from error
+
+
+def _load_plugin_toml(path: Path, description: str) -> dict[str, object]:
+    try:
+        with path.open("rb") as file:
+            return cast(dict[str, object], tomllib.load(file))
+    except tomllib.TOMLDecodeError as error:
+        raise ValueError(f"invalid {description} in {path}: {error}") from error
+
+
 def validate(config: PluginConfig | JsonObject) -> ConfigReport:
     """Validate a plugin configuration without changing runtime state.
 
@@ -433,7 +563,7 @@ async def initialize(config: PluginConfig | JsonObject) -> ConfigReport:
 
 async def initialize_with_dynamic_plugins(
     config: PluginConfig | JsonObject,
-    dynamic_plugins: list[DynamicPluginActivationSpec | JsonObject],
+    dynamic_plugins: Sequence[DynamicPluginActivationSpec | JsonObject],
 ) -> PluginHostActivation:
     """Initialize registered components with dynamic plugins as one owned host.
 
@@ -467,8 +597,27 @@ def clear() -> None:
     Behavior:
         This removes active component registrations but leaves the plugin kind
         registry intact for future validation or initialization.
+
+    Raises:
+        RuntimeError: If called while an ``asyncio`` event loop is running on
+            the current thread. Use :func:`clear_async` instead.
     """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("plugin.clear() cannot block a running asyncio event loop; use 'await plugin.clear_async()'")
     _clear_plugin_configuration()
+
+
+async def clear_async() -> None:
+    """Clear the active plugin configuration without blocking ``asyncio``.
+
+    Native teardown runs outside the Python event-loop thread so queued event
+    sanitizers can finish before their plugin-owned registrations are removed.
+    """
+    await _clear_plugin_configuration_async()
 
 
 @asynccontextmanager
@@ -493,19 +642,20 @@ async def plugin(config: PluginConfig | JsonObject, *, clear_on_exit: bool = Tru
             await subscribers.flush_async()
         finally:
             if clear_on_exit:
-                clear()
+                await clear_async()
 
 
 def report() -> ConfigReport | None:
-    """Return the last successful plugin report.
+    """Return the active plugin report or a failed-teardown diagnostic report.
 
     Returns:
-        The active `ConfigReport`, or `None` when no plugin configuration is
-        currently active.
+        The active `ConfigReport`, a report retained after a teardown failure
+        with runtime diagnostics, or `None` when neither exists.
 
     Behavior:
-        This reports the last successfully activated configuration snapshot. It
-        does not revalidate plugin state or inspect pending registrations.
+        A retained teardown report is cleared by the next successful
+        activation or clean clear. This function does not revalidate plugin
+        state or inspect pending registrations.
     """
     return cast(ConfigReport | None, _active_plugin_report())
 
@@ -559,6 +709,7 @@ def deregister(plugin_kind: str) -> bool:
 __all__ = [
     "ComponentSpec",
     "ConfigDiagnostic",
+    "RuntimeDiagnostic",
     "ConfigPolicy",
     "ConfigReport",
     "DynamicPluginActivationSpec",
@@ -567,8 +718,10 @@ __all__ = [
     "PluginContext",
     "PluginHostActivation",
     "Plugin",
+    "load_dynamic_plugin_activation_specs",
     "initialize_with_dynamic_plugins",
     "clear",
+    "clear_async",
     "initialize",
     "deregister",
     "list_kinds",

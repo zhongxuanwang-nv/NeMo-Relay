@@ -156,7 +156,7 @@ async function executeTool(name) {
   return lib.toolCallExecute(
     name,
     { original: true },
-    (args) => ({ ...args, downstream: true }),
+    (args) => ({ result: { ...args, downstream: true } }),
     null,
     null,
     null,
@@ -207,12 +207,12 @@ describe('dynamic plugin host', () => {
   it('layers plugins.toml static base components with dynamic plugins', async () => {
     const staticKind = 'node.fixture.static-base';
     const projectRoot = path.join(tempRoot, 'file-static-base-project');
-    const projectConfigDirectory = path.join(projectRoot, '.nemo-relay');
     const isolatedUserConfig = path.join(projectRoot, 'xdg');
-    mkdirSync(projectConfigDirectory, { recursive: true });
-    mkdirSync(isolatedUserConfig, { recursive: true });
+    const userConfigDirectory = path.join(isolatedUserConfig, 'nemo-relay');
+    const pluginsToml = path.join(userConfigDirectory, 'plugins.toml');
+    mkdirSync(userConfigDirectory, { recursive: true });
     writeFileSync(
-      path.join(projectConfigDirectory, 'plugins.toml'),
+      pluginsToml,
       `version = 1
 
 [[components]]
@@ -237,9 +237,16 @@ enabled = true
       activation = await plugin.initializeWithDynamicPlugins({ version: 1, components: [] }, [
         activationSpec('fixture_native', 'rust_dynamic', nativeManifestRef),
       ]);
+      assert.equal(activation.report.diagnostics.length, 1);
+      const diagnostic = activation.report.diagnostics[0];
+      assert.equal(diagnostic.level, 'warning');
+      assert.equal(diagnostic.code, 'plugin.configuration_inherited');
+      assert.ok(diagnostic.message.endsWith(path.resolve(pluginsToml)));
+      assert.equal(diagnostic.component, undefined);
+      assert.equal(diagnostic.field, undefined);
       const result = await executeTool('node_static_and_dynamic_tool');
-      assert.equal(result.staticBase, true);
-      assert.equal(result.native_plugin_tool_execution, true);
+      assert.equal(result.result.staticBase, true);
+      assert.equal(result.result.native_plugin_tool_execution, true);
     } finally {
       await activation?.close();
       plugin.deregister(staticKind);
@@ -262,9 +269,9 @@ enabled = true
       assert.throws(() => plugin.clear(), /active dynamic plugin host/i);
 
       const toolResult = await executeTool('node_native_dynamic_tool');
-      assert.equal(toolResult.downstream, true);
-      assert.equal(toolResult.native_plugin_tool_execution_request, true);
-      assert.equal(toolResult.native_plugin_tool_execution, true);
+      assert.equal(toolResult.result.downstream, true);
+      assert.equal(toolResult.result.native_plugin_tool_execution_request, true);
+      assert.equal(toolResult.result.native_plugin_tool_execution, true);
 
       const llmResult = await executeLlm('node_native_dynamic_llm');
       assert.equal(llmResult.downstream, true);
@@ -276,7 +283,7 @@ enabled = true
       await activation.close();
 
       const toolAfterClose = await executeTool('node_native_closed_tool');
-      assert.deepEqual(toolAfterClose, { original: true, downstream: true });
+      assert.deepEqual(toolAfterClose, { result: { original: true, downstream: true } });
       const llmAfterClose = await executeLlm('node_native_closed_llm');
       assert.equal(llmAfterClose.downstream, true);
       assert.equal(llmAfterClose.requestContent.native_plugin_llm_execution_request, undefined);
@@ -297,14 +304,14 @@ enabled = true
       assert.equal(activation[Symbol.asyncDispose], lib.DynamicPluginActivation.prototype.close);
       assert.equal('[Symbol.asyncDispose]' in lib.DynamicPluginActivation.prototype, false);
       const toolResult = await executeTool('node_native_async_dispose_tool');
-      assert.equal(toolResult.native_plugin_tool_execution, true);
+      assert.equal(toolResult.result.native_plugin_tool_execution, true);
       throw new Error('managed activation scope failed');
     }, /managed activation scope failed/);
 
     assert.equal(disposedActivation.active, false);
     await disposedActivation[Symbol.asyncDispose]();
     const toolAfterDispose = await executeTool('node_native_async_disposed_tool');
-    assert.deepEqual(toolAfterDispose, { original: true, downstream: true });
+    assert.deepEqual(toolAfterDispose, { result: { original: true, downstream: true } });
   });
 
   it('owns worker managed callbacks until close', async () => {
@@ -314,8 +321,8 @@ enabled = true
     try {
       assert.deepEqual(activation.report.diagnostics, []);
       const toolResult = await executeTool('node_worker_dynamic_tool');
-      assert.equal(toolResult.worker_plugin_tool_execution_request, true);
-      assert.equal(toolResult.worker_plugin_tool_execution, true);
+      assert.equal(toolResult.result.worker_plugin_tool_execution_request, true);
+      assert.equal(toolResult.result.worker_plugin_tool_execution, true);
 
       const llmResult = await executeLlm('node_worker_dynamic_llm');
       assert.equal(llmResult.requestContent.worker_plugin_llm_execution_request, true);
@@ -325,7 +332,7 @@ enabled = true
     }
 
     const toolAfterClose = await executeTool('node_worker_closed_tool');
-    assert.deepEqual(toolAfterClose, { original: true, downstream: true });
+    assert.deepEqual(toolAfterClose, { result: { original: true, downstream: true } });
     const llmAfterClose = await executeLlm('node_worker_closed_llm');
     assert.equal(llmAfterClose.requestContent.worker_plugin_llm_execution_request, undefined);
     assert.equal(llmAfterClose.worker_plugin_llm_execution, undefined);

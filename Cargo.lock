@@ -92,9 +92,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arc-swap"
@@ -499,15 +499,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "concurrent-queue"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "console"
 version = "0.15.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -813,11 +804,10 @@ dependencies = [
 
 [[package]]
 name = "event-listener"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
- "concurrent-queue",
  "parking",
  "pin-project-lite",
 ]
@@ -1712,7 +1702,7 @@ dependencies = [
 
 [[package]]
 name = "nemo-relay"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "bitflags",
  "chrono",
@@ -1727,8 +1717,10 @@ dependencies = [
  "object_store",
  "opentelemetry",
  "opentelemetry-otlp",
+ "opentelemetry-proto",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
+ "prost",
  "reqwest 0.12.28",
  "schemars",
  "semver",
@@ -1746,13 +1738,15 @@ dependencies = [
  "toml",
  "tonic",
  "tower",
+ "tracing",
  "typed-builder",
+ "unicode-general-category",
  "uuid",
 ]
 
 [[package]]
 name = "nemo-relay-adaptive"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "log",
@@ -1773,13 +1767,12 @@ dependencies = [
 
 [[package]]
 name = "nemo-relay-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-stream",
  "axum",
  "base64",
  "bytes",
- "chrono",
  "clap",
  "clap_complete",
  "console 0.16.3",
@@ -1829,7 +1822,7 @@ dependencies = [
 
 [[package]]
 name = "nemo-relay-ffi"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "cbindgen",
  "chrono",
@@ -1847,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "nemo-relay-node"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "napi",
@@ -1865,7 +1858,7 @@ dependencies = [
 
 [[package]]
 name = "nemo-relay-pii-redaction"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "futures",
  "log",
@@ -1882,16 +1875,19 @@ dependencies = [
 
 [[package]]
 name = "nemo-relay-plugin"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
+ "futures",
  "nemo-relay-types",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
 name = "nemo-relay-python"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "nemo-relay",
@@ -1909,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "nemo-relay-switchyard"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -1926,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "nemo-relay-types"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "bitflags",
  "chrono",
@@ -1939,7 +1935,7 @@ dependencies = [
 
 [[package]]
 name = "nemo-relay-worker"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "futures-util",
  "hyper-util",
@@ -1956,7 +1952,7 @@ dependencies = [
 
 [[package]]
 name = "nemo-relay-worker-proto"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -2130,6 +2126,7 @@ dependencies = [
  "js-sys",
  "pin-project-lite",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -3742,6 +3739,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

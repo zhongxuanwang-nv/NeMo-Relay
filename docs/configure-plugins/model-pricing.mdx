@@ -56,26 +56,35 @@ Use `type = "file"` with a JSON catalog path or `type = "inline"` with the
 catalog in `plugins.toml`. Relay checks sources and catalog entries in listed
 order, and it uses the first entry that matches the provider and model.
 
-When Relay merges explicit-or-user, project, and system configuration files, it
-prepends higher-priority `sources` instead of replacing lower-priority sources.
-The effective order is system, project, then explicit-or-user. This lets an
+Relay publishes a numeric total only when every nonzero usage category has a
+configured rate. If a response reports nonzero cache-read or cache-write usage
+and the matching catalog entry omits `cache_read_per_million` or
+`cache_write_per_million`, Relay keeps the priced components but omits the
+aggregate total. Set a rate to `0.0` when a category is intentionally free.
+
+When Relay merges explicit-or-user and system configuration files, it prepends
+higher-priority `sources` instead of replacing lower-priority sources. The
+effective order is system, then explicit-or-user. This lets an
 enterprise catalog override narrower catalogs while preserving those catalogs
 as fallbacks.
 
 ## Manage Catalog Sources with the CLI
 
-Run the following commands to validate a catalog and add it to project
+Run the following commands to validate a catalog and add it to user
 configuration:
 
 ```bash
-nemo-relay model-pricing validate /path/to/pricing.json
-nemo-relay model-pricing init --project
-nemo-relay model-pricing add-source /path/to/pricing.json --project
+nemo-relay model-pricing validate <path/to/pricing.json>
+nemo-relay model-pricing init --user
+nemo-relay model-pricing add-source <path/to/pricing.json> --user
 ```
 
-Use `--user` for the user configuration file or `--global` for
-`/etc/nemo-relay/plugins.toml`. `add-source` places a new source ahead of
-existing sources by default. Use `--append` to keep it as a fallback.
+Replace `<path/to/pricing.json>` with the path to your pricing catalog before
+running either command. Use `--user` for the user configuration file or
+`--global` for system configuration at `/etc/nemo-relay/plugins.toml` on Unix or
+`%ProgramData%\nemo-relay\plugins.toml` on Windows. `add-source` places a new
+source ahead of existing sources by default. Use `--append` to keep it as a
+fallback.
 
 ## Verify the Active Configuration
 

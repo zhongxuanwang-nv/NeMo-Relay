@@ -34,18 +34,23 @@ pub struct ScopeStack {
     scope_registries: HashMap<Uuid, ScopeLocalRegistries>,
     fresh_agents: HashSet<Uuid>,
     propagated_parent_uuid: Option<Uuid>,
+    propagated_root_uuid: Option<Uuid>,
 }
 
 /// Versioned, transport-neutral causal context for crossing a Relay boundary.
 ///
 /// Applications are responsible for serializing, transporting, authenticating,
 /// and trusting this value. It intentionally contains only Relay identifiers;
-/// OpenTelemetry `traceparent` and `tracestate` remain transport sidecars.
+/// OpenTelemetry `traceparent` and `tracestate` remain transport sidecars. A
+/// context without a `root_uuid` preserves Relay event parentage when imported.
+/// The first local OpenTelemetry span created after import starts a new trace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PropagationContext {
     /// Wire-format version. Version 1 is the only currently supported value.
     pub version: u16,
-    /// Stable session root when the sending application knows one.
+    /// Stable session root when the sending application knows one. When this
+    /// root is omitted, the first local OpenTelemetry span after import starts
+    /// a new trace.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_uuid: Option<Uuid>,
     /// Immediate Relay event or scope that caused the boundary crossing.
@@ -60,6 +65,20 @@ impl PropagationContext {
     pub fn to_json(&self) -> Result<String> {
         self.validate()?;
         Ok(serde_json::to_string(self).expect("PropagationContext is always JSON serializable"))
+    }
+
+    /// Convert this rooted context to a W3C `traceparent` header value.
+    pub fn to_traceparent(&self) -> Result<String> {
+        self.validate()?;
+        let Some(root_uuid) = self.root_uuid else {
+            return Err(FlowError::InvalidArgument(
+                "rootless propagation context cannot be converted to traceparent".into(),
+            ));
+        };
+        Ok(crate::observability::format_traceparent(
+            root_uuid,
+            self.parent_uuid,
+        ))
     }
 
     /// Deserialize and validate a context received from application-managed transport.
@@ -102,6 +121,7 @@ impl ScopeStack {
             scope_registries: self.scope_registries.clone(),
             fresh_agents: self.fresh_agents.clone(),
             propagated_parent_uuid: self.propagated_parent_uuid,
+            propagated_root_uuid: self.propagated_root_uuid,
         }
     }
 
@@ -121,6 +141,7 @@ impl ScopeStack {
             scope_registries: HashMap::new(),
             fresh_agents: HashSet::from([root_uuid]),
             propagated_parent_uuid: None,
+            propagated_root_uuid: None,
         }
     }
 
@@ -162,6 +183,7 @@ impl ScopeStack {
             scope_registries: HashMap::new(),
             fresh_agents: HashSet::from([root_uuid]),
             propagated_parent_uuid: context.root_uuid.map(|_| context.parent_uuid),
+            propagated_root_uuid: context.root_uuid,
         })
     }
 
@@ -441,12 +463,14 @@ pub fn create_scope_stack_from_propagation(
 ///
 /// Capture the parent before spawning concurrent work, then install the
 /// returned stack with `TASK_SCOPE_STACK.scope(...)`. The fork preserves event
-/// parentage but does not transfer scope-local registrations.
+/// parentage but does not transfer scope-local registrations. Because the fork
+/// does not assert a root UUID, its first local OpenTelemetry span starts a new
+/// trace.
 ///
 /// # Examples
 ///
 /// ```no_run
-/// # async fn example() -> nemo_relay::Result<()> {
+/// # async fn example() -> nemo_relay::error::Result<()> {
 /// use nemo_relay::api::runtime::{TASK_SCOPE_STACK, fork_scope_stack};
 ///
 /// let stack = fork_scope_stack()?;
@@ -462,6 +486,11 @@ pub fn fork_scope_stack() -> Result<ScopeStackHandle> {
 }
 
 /// Capture the current causal parent without asserting a session root.
+///
+/// Importing the returned context preserves Relay event parentage but starts a
+/// new local OpenTelemetry trace. Use [`capture_propagation_context_with_root`]
+/// when the receiver should participate in a Relay-derived trace rooted at a
+/// stable application UUID.
 pub fn capture_propagation_context() -> Result<PropagationContext> {
     capture_propagation_context_with_root(None)
 }
@@ -479,6 +508,44 @@ pub fn capture_propagation_context_with_root(
     };
     context.validate()?;
     Ok(context)
+}
+
+/// Capture the current rooted Relay context as a W3C `traceparent` value.
+pub fn capture_traceparent() -> Result<String> {
+    let active_uuid = active_event_uuid();
+    let parent_uuid = active_uuid.unwrap_or_else(|| task_scope_top().uuid);
+    let stack = current_scope_stack();
+    let stack_guard = stack
+        .read()
+        .map_err(|error| FlowError::Internal(error.to_string()))?;
+    let root_uuid = stack_guard
+        .propagated_root_uuid
+        .or_else(|| stack_guard.scopes().get(1).map(|scope| scope.uuid))
+        .or(active_uuid)
+        .ok_or_else(|| {
+            FlowError::InvalidArgument(
+                "no emitted Relay scope is available for traceparent capture".into(),
+            )
+        })?;
+    Ok(crate::observability::format_traceparent(
+        root_uuid,
+        parent_uuid,
+    ))
+}
+
+pub(crate) fn traceparent_for_llm(parent_uuid: Uuid) -> Result<String> {
+    let stack = current_scope_stack();
+    let stack_guard = stack
+        .read()
+        .map_err(|error| FlowError::Internal(error.to_string()))?;
+    let root_uuid = stack_guard
+        .propagated_root_uuid
+        .or_else(|| stack_guard.scopes().get(1).map(|scope| scope.uuid))
+        .unwrap_or(parent_uuid);
+    Ok(crate::observability::format_traceparent(
+        root_uuid,
+        parent_uuid,
+    ))
 }
 
 tokio::task_local! {

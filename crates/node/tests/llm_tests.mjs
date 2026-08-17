@@ -8,7 +8,6 @@ import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { waitForSubscriberCallbacks } from './test_support.mjs';
 
 const require = createRequire(import.meta.url);
 const lib = require('../index.js');
@@ -91,6 +90,9 @@ function sparseArray() {
 function unprintableError() {
   const error = new Error('sanitize request guardrail failed');
   Object.defineProperties(error, {
+    name: {
+      value: 'GetterError',
+    },
     message: {
       get() {
         throw new Error('message getter boom');
@@ -177,10 +179,7 @@ describe('LLM lifecycle', () => {
       const native = makeNative();
       const handle = llmCall('evt_llm', native, null, null, null, null, null);
       llmCallEnd(handle, {}, null, null);
-      const deadline = Date.now() + 2000;
-      while (events.length < 2 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 10));
-      }
+      await flushSubscribers();
       assert.ok(events.length >= 2, 'Expected at least 2 events');
     } finally {
       deregisterSubscriber('node_llm_evt_sub');
@@ -289,11 +288,11 @@ describe('LLM execute', () => {
 
       await assert.rejects(
         () =>
-          llmCallExecuteAsync(
+          llmCallExecute(
             'exec_status_error_llm',
             makeNative(),
-            async () => {
-              throw new Error('llm status failure');
+            () => {
+              throw unprintableError();
             },
             null,
             null,
@@ -303,14 +302,10 @@ describe('LLM execute', () => {
             },
             null,
           ),
-        /llm status failure/,
+        /JavaScript callback failed/,
       );
 
-      await waitForSubscriberCallbacks(
-        () =>
-          events.some((e) => e.name === 'exec_status_ok_llm' && e.scope_category === 'end') &&
-          events.some((e) => e.name === 'exec_status_error_llm' && e.scope_category === 'end'),
-      );
+      await flushSubscribers();
       const okEnd = events.find(
         (e) =>
           e.name === 'exec_status_ok_llm' && e.kind === 'scope' && e.category === 'llm' && e.scope_category === 'end',
@@ -328,7 +323,9 @@ describe('LLM execute', () => {
       assert.ok(errorEnd, 'expected failed llm end event');
       assert.equal(errorEnd.metadata.caller, 'node-llm-error');
       assert.equal(errorEnd.metadata['otel.status_code'], 'ERROR');
-      assert.match(errorEnd.metadata['otel.status_description'], /llm status failure/);
+      assert.match(errorEnd.metadata['otel.status_description'], /JavaScript callback failed/);
+      assert.equal(errorEnd.metadata['error.type'], 'internal_error');
+      assert.equal(errorEnd.metadata['exception.type'], 'GetterError');
     } finally {
       deregisterSubscriber('node_llm_status_metadata_sub');
     }
@@ -403,13 +400,9 @@ describe('LLM guardrails', () => {
     try {
       const result = await llmCallExecute('contextual_sanitize_llm', makeNative(), () => ({ ok: true }));
       assert.deepEqual(result, { ok: true });
+      await flushSubscribers();
       assert.equal(requestContextChecked, true);
       assert.equal(responseContextChecked, true);
-      await waitForSubscriberCallbacks(
-        () =>
-          events.some((event) => event.name === 'contextual_sanitize_llm' && event.scope_category === 'start') &&
-          events.some((event) => event.name === 'contextual_sanitize_llm' && event.scope_category === 'end'),
-      );
       const start = events.find(
         (event) => event.name === 'contextual_sanitize_llm' && event.scope_category === 'start',
       );
@@ -512,6 +505,7 @@ describe('LLM guardrails', () => {
         ({ annotated, original }) => codec.encode(annotated, original),
         codec.decodeResponse.bind(codec),
       );
+      await flushSubscribers();
       assert.deepEqual(result, response);
       assert.equal(requestDecoded, true);
       assert.equal(responseDecoded, true);
@@ -622,6 +616,7 @@ describe('LLM guardrails', () => {
       const stream = await execution;
       assert.deepEqual(await stream.next(), { token: 'done' });
       assert.equal(await stream.next(), null);
+      await flushSubscribers();
       assert.deepEqual(observed, [invocationScope.uuid, invocationScope.uuid]);
     } finally {
       lib.withScopeStack(invocationStack, () => lib.popScope(invocationScope));
@@ -798,16 +793,7 @@ describe('LLM guardrails', () => {
       assert.deepEqual(result, {
         model: 'test-model',
       });
-      const deadline = Date.now() + 2000;
-      while (
-        !events.some(
-          (e) =>
-            e.name === 'san_req_evt_llm' && e.kind === 'scope' && e.category === 'llm' && e.scope_category === 'start',
-        ) &&
-        Date.now() < deadline
-      ) {
-        await new Promise((r) => setTimeout(r, 10));
-      }
+      await flushSubscribers();
       const start = events.find(
         (e) =>
           e.name === 'san_req_evt_llm' && e.kind === 'scope' && e.category === 'llm' && e.scope_category === 'start',
@@ -843,16 +829,15 @@ describe('LLM guardrails', () => {
         null,
         null,
       );
-      assert.deepEqual(result, {
-        model: 'test-model',
-        headers: {},
-      });
+      const { traceparent, ...headers } = result.headers;
+      assert.deepEqual({ ...result, headers }, { model: 'test-model', headers: {} });
+      assert.match(traceparent, /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
     } finally {
       deregisterLlmSanitizeRequestGuardrail('node_llm_san_req_bad');
     }
   });
 
-  it('sanitize request guardrail failures preserve the payload and remain usable', async () => {
+  it('sanitize request guardrail failures omit the payload and remain usable', async () => {
     const events = [];
     clearLastCallbackError();
     registerSubscriber('node_llm_san_req_throw_sub', (event) => events.push(event));
@@ -862,15 +847,7 @@ describe('LLM guardrails', () => {
     try {
       const request = makeNative();
       await llmCallExecute('llm_san_req_throw', request, () => ({ ok: true }), null, null, null, null, null);
-      await waitForSubscriberCallbacks(() =>
-        events.some(
-          (event) =>
-            event.name === 'llm_san_req_throw' &&
-            event.kind === 'scope' &&
-            event.category === 'llm' &&
-            event.scope_category === 'start',
-        ),
-      );
+      await flushSubscribers();
       const start = events.find(
         (event) =>
           event.name === 'llm_san_req_throw' &&
@@ -878,7 +855,7 @@ describe('LLM guardrails', () => {
           event.category === 'llm' &&
           event.scope_category === 'start',
       );
-      assert.deepEqual(start.data, { headers: request.headers, content: request.content });
+      assert.equal(start.data, null);
       assert.equal(getLastCallbackError(), 'internal error: unknown error');
 
       deregisterLlmSanitizeRequestGuardrail('node_llm_san_req_throw');
@@ -958,16 +935,7 @@ describe('LLM guardrails', () => {
       assert.deepEqual(result, {
         ok: true,
       });
-      const deadline = Date.now() + 2000;
-      while (
-        !events.some(
-          (e) =>
-            e.name === 'san_resp_evt_llm' && e.kind === 'scope' && e.category === 'llm' && e.scope_category === 'end',
-        ) &&
-        Date.now() < deadline
-      ) {
-        await new Promise((r) => setTimeout(r, 10));
-      }
+      await flushSubscribers();
       const end = events.find(
         (e) =>
           e.name === 'san_resp_evt_llm' && e.kind === 'scope' && e.category === 'llm' && e.scope_category === 'end',
@@ -982,7 +950,7 @@ describe('LLM guardrails', () => {
     }
   });
 
-  it('sanitize response guardrail failures preserve the payload and remain usable', async () => {
+  it('sanitize response guardrail failures omit the payload and remain usable', async () => {
     const events = [];
     clearLastCallbackError();
     registerSubscriber('node_llm_san_resp_throw_sub', (event) => events.push(event));
@@ -992,15 +960,7 @@ describe('LLM guardrails', () => {
     try {
       const response = { ok: true };
       await llmCallExecute('llm_san_resp_throw', makeNative(), () => response, null, null, null, null, null);
-      await waitForSubscriberCallbacks(() =>
-        events.some(
-          (event) =>
-            event.name === 'llm_san_resp_throw' &&
-            event.kind === 'scope' &&
-            event.category === 'llm' &&
-            event.scope_category === 'end',
-        ),
-      );
+      await flushSubscribers();
       const end = events.find(
         (event) =>
           event.name === 'llm_san_resp_throw' &&
@@ -1008,7 +968,7 @@ describe('LLM guardrails', () => {
           event.category === 'llm' &&
           event.scope_category === 'end',
       );
-      assert.deepEqual(end.data, response);
+      assert.equal(end.data, null);
       assert.match(getLastCallbackError() ?? '', /response sanitizer boom/i);
 
       deregisterLlmSanitizeResponseGuardrail('node_llm_san_resp_throw');
@@ -1125,6 +1085,93 @@ describe('LLM guardrails', () => {
 // ===========================================================================
 
 describe('LLM intercepts', () => {
+  it('execution callbacks preserve the managed propagation parent across await', async () => {
+    const events = [];
+    const observed = [];
+    registerSubscriber('node_llm_exec_propagation_parent', (event) => events.push(event));
+    registerLlmExecutionIntercept('node_llm_exec_propagation_parent', 10, async (request, next) => {
+      observed.push(['intercept-before', lib.capturePropagationContext().parentUuid, lib.captureTraceparent()]);
+      await new Promise((resolve) => setImmediate(resolve));
+      observed.push(['intercept-after', lib.capturePropagationContext().parentUuid, lib.captureTraceparent()]);
+      return next(request);
+    });
+    try {
+      const result = await llmCallExecuteAsync(
+        'propagation_parent_llm',
+        makeNative(),
+        async () => {
+          observed.push(['provider-before', lib.capturePropagationContext().parentUuid, lib.captureTraceparent()]);
+          await new Promise((resolve) => setImmediate(resolve));
+          observed.push(['provider-after', lib.capturePropagationContext().parentUuid, lib.captureTraceparent()]);
+          return { ok: true };
+        },
+        null,
+        null,
+        null,
+        null,
+        null,
+      );
+      assert.deepEqual(result, { ok: true });
+      await flushSubscribers();
+      const start = events.find(
+        (event) =>
+          event.name === 'propagation_parent_llm' && event.kind === 'scope' && event.scope_category === 'start',
+      );
+      assert.ok(start, 'expected managed LLM start event');
+      const traceparent = `00-${start.uuid.replaceAll('-', '')}-${start.uuid.replaceAll('-', '').slice(-16)}-01`;
+      assert.deepEqual(observed, [
+        ['intercept-before', start.uuid, traceparent],
+        ['intercept-after', start.uuid, traceparent],
+        ['provider-before', start.uuid, traceparent],
+        ['provider-after', start.uuid, traceparent],
+      ]);
+    } finally {
+      deregisterLlmExecutionIntercept('node_llm_exec_propagation_parent');
+      deregisterSubscriber('node_llm_exec_propagation_parent');
+    }
+  });
+
+  it('execution callbacks preserve an imported trace root', async () => {
+    const rootUuid = '018f13f0-7c1a-7a80-8000-000000000701';
+    const parentUuid = '018f13f0-7c1a-7a80-8000-000000000702';
+    const stack = lib.createScopeStackFromPropagation({ version: 1, rootUuid, parentUuid });
+    const events = [];
+    const observed = [];
+    registerSubscriber('node_llm_exec_propagated_trace_root', (event) => events.push(event));
+    registerLlmExecutionIntercept('node_llm_exec_propagated_trace_root', 10, async (request, next) => {
+      observed.push(lib.captureTraceparent());
+      return next(request);
+    });
+    try {
+      await lib.withScopeStack(stack, () =>
+        llmCallExecuteAsync(
+          'propagated_trace_root_llm',
+          makeNative(),
+          async () => {
+            observed.push(lib.captureTraceparent());
+            return { ok: true };
+          },
+          null,
+          null,
+          null,
+          null,
+          null,
+        ),
+      );
+      await flushSubscribers();
+      const start = events.find(
+        (event) =>
+          event.name === 'propagated_trace_root_llm' && event.kind === 'scope' && event.scope_category === 'start',
+      );
+      assert.ok(start, 'expected managed LLM start event');
+      const expected = `00-${rootUuid.replaceAll('-', '')}-${start.uuid.replaceAll('-', '').slice(-16)}-01`;
+      assert.deepEqual(observed, [expected, expected]);
+    } finally {
+      deregisterLlmExecutionIntercept('node_llm_exec_propagated_trace_root');
+      deregisterSubscriber('node_llm_exec_propagated_trace_root');
+    }
+  });
+
   it('request intercept', () => {
     registerLlmRequestIntercept('node_llm_req_int', 10, false, ({ name, request, annotated }) => {
       request.intercepted = true;
@@ -1337,7 +1384,7 @@ describe('LLM intercepts', () => {
     let providerSideEffects = 0;
     registerLlmExecutionIntercept('node_llm_exec_abort_started_provider', 10, async (native, next) => {
       downstream = next(native);
-      void downstream.catch(() => {});
+      downstream.catch(() => undefined);
       await started;
       return { source: 'intercept' };
     });
@@ -1597,6 +1644,31 @@ describe('LLM intercepts', () => {
     } finally {
       deregisterSubscriber('node_default_lazy_stream_context');
     }
+  });
+
+  it('default lazy stream expires its callback context when the provider ends', async () => {
+    const baseline = {
+      active: lib.scopeStackActive(),
+      parentUuid: lib.capturePropagationContext().parentUuid,
+    };
+    let resolveLateContext;
+    const lateContext = new Promise((resolve) => {
+      resolveLateContext = resolve;
+    });
+
+    const stream = await llmStreamCallExecute('node_default_lazy_stream_expiry', makeNative(), (wrapper) => {
+      lib.pushStreamChunk(wrapper.__nemo_relay_stream_id, { token: 'done' });
+      setImmediate(() => {
+        resolveLateContext({
+          active: lib.scopeStackActive(),
+          parentUuid: lib.capturePropagationContext().parentUuid,
+        });
+      });
+      lib.endStream(wrapper.__nemo_relay_stream_id);
+    });
+    assert.deepEqual(await stream.next(), { token: 'done' });
+    assert.equal(await stream.next(), null);
+    assert.deepEqual(await lateContext, baseline);
   });
 
   it('stream execution next honors concurrent per-call scope-stack replacements', async () => {
@@ -1925,7 +1997,9 @@ describe('LLM intercepts', () => {
     ];
 
     for (const registration of registrations) {
-      const declaration = declarations.match(new RegExp(`export declare function ${registration}\\([^\\n]+`))?.[0];
+      const declaration = declarations.match(
+        new RegExp(String.raw`export declare function ${registration}\([^\n]+`),
+      )?.[0];
       assert.ok(declaration, `missing declaration for ${registration}`);
       assert.doesNotMatch(declaration, /\.\.\.args: any\[\]/, `${registration} must not expose an any callback`);
       assert.match(declaration, /Promise</, `${registration} must expose its Promise callback form`);
@@ -1934,6 +2008,13 @@ describe('LLM intercepts', () => {
       declarations.split('next: (request: Json) => Promise<Json[]>').length - 1,
       2,
       'global and scope-local stream intercept declarations must expose the buffered next contract',
+    );
+    assert.equal(
+      declarations.split(
+        'next: (args: Json) => ToolExecutionResult | Promise<ToolExecutionResult>',
+      ).length - 1,
+      2,
+      'global and scope-local tool intercept declarations must expose canonical tool results',
     );
   });
 
@@ -2009,10 +2090,7 @@ describe('LLM event fields', () => {
         },
       );
 
-      const deadline = Date.now() + 2000;
-      while (events.filter((e) => e.name === 'field_llm').length < 2 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 10));
-      }
+      await flushSubscribers();
 
       const start = events.find(
         (e) => e.name === 'field_llm' && e.kind === 'scope' && e.category === 'llm' && e.scope_category === 'start',

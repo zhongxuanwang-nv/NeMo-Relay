@@ -4,6 +4,7 @@
 //! Optional observability integrations for NeMo Relay Core.
 
 use crate::api::event::EventNormalizationExt;
+use crate::codec::response::{AnnotatedLlmResponse, ApiSpecificResponse, Usage};
 use serde::{Deserialize, Serialize};
 
 /// Copies a projected OTLP attribute to a second attribute name.
@@ -43,7 +44,65 @@ pub(crate) mod manual;
 pub(crate) mod openinference;
 pub mod otel;
 mod otel_genai;
+pub mod otel_logs;
+pub mod otel_metrics;
+mod otel_signal;
 pub mod plugin_component;
+
+pub use otel_signal::{OpenTelemetryRuntimeDiagnostic, OpenTelemetryRuntimeDiagnostics};
+
+/// Return the provider-independent input total used by semantic observability
+/// projections. Anthropic reports uncached, cache-read, and cache-creation
+/// input tokens separately, while providers such as OpenAI include cache reads
+/// in their prompt count.
+pub(crate) fn input_tokens_including_cache(
+    provider: Option<&str>,
+    response: Option<&AnnotatedLlmResponse>,
+    usage: &Usage,
+) -> Option<u64> {
+    let prompt_tokens = usage.prompt_tokens?;
+    if !uses_separate_anthropic_cache_tokens(provider, response) {
+        return Some(prompt_tokens);
+    }
+    [usage.cache_read_tokens, usage.cache_write_tokens]
+        .into_iter()
+        .flatten()
+        .try_fold(prompt_tokens, u64::checked_add)
+}
+
+/// Return the provider-independent prompt-plus-completion total used by
+/// semantic observability projections.
+pub(crate) fn total_tokens_including_cache(
+    provider: Option<&str>,
+    response: Option<&AnnotatedLlmResponse>,
+    usage: &Usage,
+) -> Option<u64> {
+    if !uses_separate_anthropic_cache_tokens(provider, response) {
+        return usage.total_tokens;
+    }
+    match (
+        input_tokens_including_cache(provider, response, usage),
+        usage.completion_tokens,
+    ) {
+        (Some(input), Some(output)) => input.checked_add(output),
+        _ => usage.total_tokens,
+    }
+}
+
+fn uses_separate_anthropic_cache_tokens(
+    provider: Option<&str>,
+    response: Option<&AnnotatedLlmResponse>,
+) -> bool {
+    response.is_some_and(|response| {
+        matches!(
+            response.api_specific.as_ref(),
+            Some(ApiSpecificResponse::AnthropicMessages { .. })
+        )
+    }) || provider.is_some_and(|provider| {
+        let provider = provider.to_ascii_lowercase();
+        provider.starts_with("anthropic") || provider.starts_with("claude")
+    })
+}
 
 /// Export representation for point-in-time mark events.
 ///
@@ -95,6 +154,21 @@ pub(crate) fn relay_span_id(uuid: uuid::Uuid) -> opentelemetry::trace::SpanId {
     let mut bytes = [0; 8];
     bytes.copy_from_slice(&uuid.as_bytes()[8..]);
     opentelemetry::trace::SpanId::from_bytes(bytes)
+}
+
+/// Format a W3C traceparent from Relay's deterministic trace and span IDs.
+pub(crate) fn format_traceparent(trace_uuid: uuid::Uuid, span_uuid: uuid::Uuid) -> String {
+    let trace_id = trace_uuid
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let span_id = &span_uuid.as_bytes()[8..];
+    let span_id = span_id
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("00-{trace_id}-{span_id}-01")
 }
 
 pub(crate) fn push_common_optimization_attributes(
@@ -246,10 +320,10 @@ pub fn validate_attribute_mappings(
 ) -> std::result::Result<(), String> {
     let mut aliases = std::collections::HashSet::new();
     for mapping in mappings {
-        if mapping.key.trim().is_empty() {
+        if is_blank_attribute_mapping_name(&mapping.key) {
             return Err("attribute mapping key must not be blank".to_string());
         }
-        if mapping.alias.trim().is_empty() {
+        if is_blank_attribute_mapping_name(&mapping.alias) {
             return Err("attribute mapping alias must not be blank".to_string());
         }
         if !aliases.insert(mapping.alias.trim()) {
@@ -260,6 +334,17 @@ pub fn validate_attribute_mappings(
         }
     }
     Ok(())
+}
+
+fn is_blank_attribute_mapping_name(value: &str) -> bool {
+    value.chars().all(|character| {
+        character.is_whitespace()
+            || matches!(
+                unicode_general_category::get_general_category(character),
+                unicode_general_category::GeneralCategory::Control
+                    | unicode_general_category::GeneralCategory::Format
+            )
+    })
 }
 
 /// Projects only top-level JSON fields as OTLP attributes.
@@ -282,6 +367,36 @@ pub(crate) fn push_top_level_json_attributes(
         }
         value => push_top_level_json_value(attributes, prefix, value),
     }
+}
+
+/// Project an opaque tool-result annotation as one JSON-valued attribute.
+///
+/// The annotation is deliberately not flattened because its schema belongs to
+/// the application rather than Relay.
+pub(crate) fn push_tool_result_annotation_attribute(
+    attributes: &mut Vec<opentelemetry::KeyValue>,
+    event: &crate::api::event::Event,
+) {
+    if event.scope_category() != Some(crate::api::event::ScopeCategory::End)
+        || event.category() != Some(&crate::api::event::EventCategory::tool())
+    {
+        return;
+    }
+    let Some(annotation) = tool_result_annotation(event) else {
+        return;
+    };
+    if let Ok(value) = serde_json::to_string(&annotation) {
+        attributes.push(opentelemetry::KeyValue::new(
+            "nemo_relay.tool.result.annotation",
+            value,
+        ));
+    }
+}
+
+pub(crate) fn tool_result_annotation(
+    event: &crate::api::event::Event,
+) -> Option<crate::json::Json> {
+    event.tool_result_annotation()
 }
 
 /// Adds canonical session-correlation attributes from event metadata and the

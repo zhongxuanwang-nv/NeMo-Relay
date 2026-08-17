@@ -15,6 +15,7 @@ from nemo_relay import (
     LLMRequest,
     LLMRequestInterceptOutcome,
     ScopeType,
+    ToolExecutionResult,
     llm,
     plugin,
     scope,
@@ -251,7 +252,7 @@ class TestAdaptivePluginConfiguration:
             assert report["diagnostics"] == []
             assert plugin.report() == report
         finally:
-            plugin.clear()
+            await plugin.clear_async()
 
     async def test_configure_allows_normal_llm_call(self):
         await plugin.initialize(
@@ -277,7 +278,7 @@ class TestAdaptivePluginConfiguration:
             result = await llm.execute("test-model", request, my_llm)
             assert result["response"] == "ok"
         finally:
-            plugin.clear()
+            await plugin.clear_async()
 
     async def test_python_plugin_is_called_from_core_plugin_system(self):
         class HeaderPlugin:
@@ -368,10 +369,10 @@ class TestAdaptivePluginConfiguration:
             assert result["x-python-llm-exec"] == "priority:17"
 
             def my_tool(args):
-                return args
+                return ToolExecutionResult(args)
 
             tool_result = await tools.execute("search", {"query": "test"}, my_tool)
-            assert tool_result["x-python-tool-plugin"] == "priority:17"
+            assert tool_result.result["x-python-tool-plugin"] == "priority:17"
 
             def my_stream_llm(_request: LLMRequest):
                 async def gen():
@@ -399,7 +400,7 @@ class TestAdaptivePluginConfiguration:
                 assert chunk["x-python-llm-stream-exec"] == "priority:17"
             assert collected[0]["x-python-llm-stream-exec"] == "priority:17"
         finally:
-            plugin.clear()
+            await plugin.clear_async()
             plugin.deregister("python.test_plugin")
 
     def test_list_kinds_includes_registered_plugin(self):

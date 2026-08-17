@@ -8,15 +8,16 @@ use crate::api::runtime::NemoRelayContextState;
 use crate::api::runtime::current_scope_stack;
 use crate::api::runtime::global_context;
 use crate::api::runtime::subscriber_dispatcher::{
-    dispatch_sanitized_event, dispatch_transformed_event,
+    PendingPublication, dispatch_sanitized_event, dispatch_transformed_event,
+    register_pending_publication,
 };
 use crate::api::runtime::{
     EventSubscriberFn, ScopeStackHandle, ToolExecutionNextFn, with_active_event_uuid,
 };
 use crate::api::scope::event;
-use crate::api::scope::{EmitMarkEventParams, ScopeHandle};
+use crate::api::scope::{EmitMarkEventParams, ScopeHandle, metadata_with_log_severity};
 use crate::api::shared::{
-    ensure_runtime_owner, metadata_with_otel_status, resolve_parent_uuid,
+    ensure_runtime_owner, metadata_with_otel_error, metadata_with_otel_status, resolve_parent_uuid,
     snapshot_event_sanitizers, snapshot_event_subscribers,
 };
 use crate::api::skill_load;
@@ -27,12 +28,10 @@ use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 use uuid::Uuid;
 
-pub use nemo_relay_types::api::tool::{ToolAttributes, ToolExecutionInterceptOutcome};
-
-fn queue_sanitized_event(event: Event, subscribers: &[EventSubscriberFn]) -> bool {
-    let scope_stack = current_scope_stack();
-    queue_sanitized_event_with_scope_stack(event, subscribers, scope_stack)
-}
+pub use nemo_relay_types::api::tool::{
+    TOOL_EXECUTION_INTERCEPT_OUTCOME_SCHEMA, TOOL_EXECUTION_RESULT_SCHEMA, ToolAttributes,
+    ToolExecutionInterceptOutcome, ToolExecutionResult,
+};
 
 fn queue_sanitized_event_with_scope_stack(
     event: Event,
@@ -200,8 +199,9 @@ pub struct ToolCallExecuteParams {
 pub struct ToolCallEndParams<'a> {
     /// Tool handle to close.
     pub handle: &'a ToolHandle,
-    /// Raw tool result associated with the end event.
-    pub result: Json,
+    /// Application result and optional opaque annotation associated with the
+    /// end event.
+    pub execution_result: ToolExecutionResult,
     /// Optional application payload retained for compatibility; Agent
     /// Trajectory Observability Format (ATOF) data is the result.
     #[builder(default)]
@@ -244,7 +244,8 @@ pub struct ToolCallEndParams<'a> {
 ///
 /// # Notes
 /// Sanitize-request guardrails affect only the emitted start-event payload, not
-/// the caller-owned `args` value.
+/// the caller-owned `args` value. If a sanitizer errors or panics, Relay omits
+/// that observability payload and does not run remaining sanitizers.
 pub fn tool_call(params: ToolCallParams<'_>) -> Result<ToolHandle> {
     ensure_runtime_owner()?;
     let scope_stack = current_scope_stack();
@@ -317,7 +318,7 @@ pub fn tool_call(params: ToolCallParams<'_>) -> Result<ToolHandle> {
                 )
                 .await;
                 let mut fields = event.sanitize_fields();
-                fields.data = Some(sanitized);
+                fields.data = sanitized;
                 event.apply_sanitize_fields(fields);
                 event
             })
@@ -338,8 +339,8 @@ async fn tool_call_with_subscriber_snapshot(
 ) -> Result<(ToolHandle, Vec<EventSubscriberFn>)> {
     ensure_runtime_owner()?;
     let parent_uuid = resolve_parent_uuid(params.parent);
+    let scope_stack = current_scope_stack();
     let (entries, subscribers) = {
-        let scope_stack = current_scope_stack();
         let scope_guard = scope_stack.read().expect("scope stack lock poisoned");
         let scope_locals = scope_guard.collect_scope_local_registries(|registries| {
             &registries.tool_sanitize_request_guardrails
@@ -354,12 +355,7 @@ async fn tool_call_with_subscriber_snapshot(
         (entries, subscribers)
     };
     let skill_loads = resolve_skill_loads(params.name, &params.args, params.metadata.as_ref());
-    let sanitized_args = NemoRelayContextState::tool_sanitize_request_snapshot_chain(
-        params.name,
-        params.args,
-        &entries,
-    )
-    .await;
+    let raw_args = params.args;
     let (handle, event, marks) = {
         let context = global_context();
         let state = context
@@ -375,7 +371,7 @@ async fn tool_call_with_subscriber_snapshot(
             .timestamp_opt(params.timestamp)
             .build();
         let handle = state.create_tool_handle(handle_params);
-        let event = state.build_tool_start_event(&handle, Some(sanitized_args));
+        let event = state.build_tool_start_event(&handle, None);
         let marks = skill_loads
             .into_iter()
             .map(|skill_load| {
@@ -397,9 +393,29 @@ async fn tool_call_with_subscriber_snapshot(
             .collect::<Vec<_>>();
         (handle, event, marks)
     };
-    queue_sanitized_event(event, &subscribers);
+    let event_sanitizers = snapshot_event_sanitizers(&event, &scope_stack).unwrap_or_default();
+    let tool_name = handle.name.clone();
+    dispatch_transformed_event(
+        event,
+        Box::new(move |mut event| {
+            Box::pin(async move {
+                let sanitized = NemoRelayContextState::tool_sanitize_request_snapshot_chain(
+                    &tool_name, raw_args, &entries,
+                )
+                .await;
+                let mut fields = event.sanitize_fields();
+                fields.data = sanitized;
+                event.apply_sanitize_fields(fields);
+                event
+            })
+        }),
+        event_sanitizers,
+        &subscribers,
+        scope_stack.clone(),
+    );
     for mark in marks {
-        queue_sanitized_event(mark, &subscribers);
+        let sanitizers = snapshot_event_sanitizers(&mark, &scope_stack).unwrap_or_default();
+        dispatch_sanitized_event(mark, sanitizers, &subscribers, scope_stack.clone());
     }
     Ok((handle, subscribers))
 }
@@ -411,10 +427,11 @@ async fn tool_call_with_subscriber_snapshot(
 ///
 /// # Parameters
 /// - `handle`: Tool handle to close.
-/// - `result`: Raw tool result associated with the end event.
+/// - `execution_result`: Application result and optional opaque annotation
+///   associated with the end event.
 /// - `data`: Optional application payload retained for compatibility. The
-///   emitted end event data is the sanitized `result` unless it sanitizes to
-///   JSON null, in which case this payload is used.
+///   emitted end event data is the sanitized application result unless it
+///   sanitizes to JSON null, in which case this payload is used.
 /// - `metadata`: Optional JSON metadata recorded on the end event.
 /// - `timestamp`: Optional timestamp recorded on the emitted end event. When
 ///   `None`, the runtime uses the current UTC time, or one microsecond after
@@ -431,7 +448,9 @@ async fn tool_call_with_subscriber_snapshot(
 ///
 /// # Notes
 /// Sanitize-response guardrails affect only the emitted end-event payload, not
-/// the caller-owned `result` value.
+/// the caller-owned execution result. General event sanitizers can rewrite or
+/// remove the emitted annotation. If a sanitizer errors or panics, Relay omits
+/// the governed observability fields and does not run remaining sanitizers.
 pub fn tool_call_end(params: ToolCallEndParams<'_>) -> Result<()> {
     ensure_runtime_owner()?;
     let scope_stack = current_scope_stack();
@@ -453,7 +472,7 @@ pub fn tool_call_end(params: ToolCallEndParams<'_>) -> Result<()> {
             subscribers,
         )
     };
-    let result = params.result;
+    let ToolExecutionResult { result, annotation } = params.execution_result;
     let fallback = params.data;
     let event = {
         let context = global_context();
@@ -480,12 +499,15 @@ pub fn tool_call_end(params: ToolCallEndParams<'_>) -> Result<()> {
                 )
                 .await;
                 let mut fields = event.sanitize_fields();
-                fields.data = if sanitized.is_null() {
-                    fallback
-                } else {
-                    Some(sanitized)
-                };
+                fields.data = sanitized.and_then(|value| {
+                    if value.is_null() {
+                        fallback
+                    } else {
+                        Some(value)
+                    }
+                });
                 event.apply_sanitize_fields(fields);
+                attach_tool_result_annotation(&mut event, annotation);
                 event
             })
         }),
@@ -502,8 +524,8 @@ async fn tool_call_end_with_pending_marks(
     lifecycle_subscribers: Option<&[EventSubscriberFn]>,
 ) -> Result<()> {
     ensure_runtime_owner()?;
+    let scope_stack = current_scope_stack();
     let (entries, subscribers) = {
-        let scope_stack = current_scope_stack();
         let scope_guard = scope_stack.read().expect("scope stack lock poisoned");
         let scope_locals = scope_guard.collect_scope_local_registries(|registries| {
             &registries.tool_sanitize_response_guardrails
@@ -521,17 +543,6 @@ async fn tool_call_end_with_pending_marks(
         (entries, subscribers)
     };
     let subscribers = lifecycle_subscribers.unwrap_or(&subscribers);
-    let sanitized_result = NemoRelayContextState::tool_sanitize_response_snapshot_chain(
-        &params.handle.name,
-        params.result,
-        &entries,
-    )
-    .await;
-    let data = if sanitized_result.is_null() {
-        params.data
-    } else {
-        Some(sanitized_result)
-    };
     let event = {
         let context = global_context();
         let state = context
@@ -540,36 +551,88 @@ async fn tool_call_end_with_pending_marks(
         state.build_tool_end_event(
             EndToolHandleParams::builder()
                 .handle(params.handle)
-                .data_opt(data)
+                .data(Json::Null)
                 .metadata_opt(params.metadata)
                 .timestamp_opt(params.timestamp)
                 .build(),
         )
     };
-    let marks = pending_marks
-        .into_iter()
-        .enumerate()
-        .map(|(index, mark)| {
-            let timestamp = *event.timestamp()
-                + TimeDelta::microseconds(i64::try_from(index).unwrap_or_default() + 1);
-            Event::Mark(MarkEvent::new(
-                BaseEvent::builder()
-                    .name(mark.name)
-                    .parent_uuid(params.handle.uuid)
-                    .timestamp(timestamp)
-                    .data_opt(mark.data)
-                    .metadata_opt(mark.metadata)
-                    .build(),
-                mark.category,
-                mark.category_profile,
-            ))
-        })
-        .collect::<Vec<_>>();
-    queue_sanitized_event(event, subscribers);
+    let mut marks = Vec::with_capacity(pending_marks.len());
+    for (index, mark) in pending_marks.into_iter().enumerate() {
+        let timestamp = *event.timestamp()
+            + TimeDelta::microseconds(i64::try_from(index).unwrap_or_default() + 1);
+        let metadata = match metadata_with_log_severity(mark.metadata, mark.severity) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let tool_uuid = params.handle.uuid.to_string();
+                log::warn!(
+                    target: "nemo_relay.observability",
+                    event = "tool_pending_mark_dropped",
+                    tool_name = params.handle.name.as_str(),
+                    tool_uuid = tool_uuid.as_str(),
+                    pending_mark_index = index,
+                    pending_mark_name = mark.name.as_str();
+                    "Tool pending mark was dropped because its severity metadata is invalid: {error}"
+                );
+                continue;
+            }
+        };
+        marks.push(Event::Mark(MarkEvent::new(
+            BaseEvent::builder()
+                .name(mark.name)
+                .parent_uuid(params.handle.uuid)
+                .timestamp(timestamp)
+                .data_opt(mark.data)
+                .data_schema_opt(mark.data_schema)
+                .metadata_opt(metadata)
+                .build(),
+            mark.category,
+            mark.category_profile,
+        )));
+    }
+    let event_sanitizers = snapshot_event_sanitizers(&event, &scope_stack).unwrap_or_default();
+    let tool_name = params.handle.name.clone();
+    let ToolExecutionResult { result, annotation } = params.execution_result;
+    let fallback = params.data;
+    dispatch_transformed_event(
+        event,
+        Box::new(move |mut event| {
+            Box::pin(async move {
+                let sanitized = NemoRelayContextState::tool_sanitize_response_snapshot_chain(
+                    &tool_name, result, &entries,
+                )
+                .await;
+                let mut fields = event.sanitize_fields();
+                fields.data = sanitized.and_then(|value| {
+                    if value.is_null() {
+                        fallback
+                    } else {
+                        Some(value)
+                    }
+                });
+                event.apply_sanitize_fields(fields);
+                attach_tool_result_annotation(&mut event, annotation);
+                event
+            })
+        }),
+        event_sanitizers,
+        subscribers,
+        scope_stack.clone(),
+    );
     for mark in marks {
-        queue_sanitized_event(mark, subscribers);
+        let sanitizers = snapshot_event_sanitizers(&mark, &scope_stack).unwrap_or_default();
+        dispatch_sanitized_event(mark, sanitizers, subscribers, scope_stack.clone());
     }
     Ok(())
+}
+
+fn attach_tool_result_annotation(event: &mut Event, annotation: Option<Json>) {
+    let Some(annotation) = annotation.filter(|value| !value.is_null()) else {
+        return;
+    };
+    if let Some(profile) = event.category_profile_mut() {
+        profile.tool_result_annotation = Some(annotation);
+    }
 }
 
 fn emit_tool_end_without_output(
@@ -595,6 +658,7 @@ struct ManagedToolCompletion {
     metadata: Option<Json>,
     subscribers: Vec<EventSubscriberFn>,
     scope_stack: ScopeStackHandle,
+    pending_publication: Option<PendingPublication>,
 }
 
 impl ManagedToolCompletion {
@@ -609,16 +673,21 @@ impl ManagedToolCompletion {
             metadata,
             subscribers: subscribers.to_vec(),
             scope_stack,
+            pending_publication: (!subscribers.is_empty())
+                .then(register_pending_publication)
+                .flatten(),
         }
     }
 
     fn disarm(&mut self) {
         self.handle = None;
+        drop(self.pending_publication.take());
     }
 }
 
 impl Drop for ManagedToolCompletion {
     fn drop(&mut self) {
+        let pending_publication = self.pending_publication.take();
         let Some(handle) = self.handle.take() else {
             return;
         };
@@ -633,6 +702,7 @@ impl Drop for ManagedToolCompletion {
             &self.subscribers,
             self.scope_stack.clone(),
         );
+        drop(pending_publication);
     }
 }
 
@@ -653,8 +723,8 @@ impl Drop for ManagedToolCompletion {
 /// - `metadata`: Optional JSON metadata recorded on emitted events.
 ///
 /// # Returns
-/// A [`Result`] containing the raw tool result returned by the callback or an
-/// execution intercept.
+/// A [`Result`] containing the application result and optional opaque
+/// annotation returned by the callback or an execution intercept.
 ///
 /// # Errors
 /// Returns [`FlowError::GuardrailRejected`] when conditional-execution
@@ -664,7 +734,7 @@ impl Drop for ManagedToolCompletion {
 /// # Notes
 /// When execution fails after the start event has been emitted, the runtime
 /// still emits a tool-end event without an output payload.
-pub async fn tool_call_execute(params: ToolCallExecuteParams) -> Result<Json> {
+pub async fn tool_call_execute(params: ToolCallExecuteParams) -> Result<ToolExecutionResult> {
     let ToolCallExecuteParams {
         name,
         args,
@@ -777,16 +847,14 @@ pub async fn tool_call_execute(params: ToolCallExecuteParams) -> Result<Json> {
     })
     .await;
     match execution {
-        Ok(outcome) => {
-            let ToolExecutionInterceptOutcome {
-                result,
-                pending_marks,
-            } = outcome;
+        Ok(mut outcome) => {
+            let pending_marks = std::mem::take(&mut outcome.pending_marks);
+            let execution_result = outcome.into_execution_result();
             let end_metadata = metadata_with_otel_status(metadata, "OK", None);
             tool_call_end_with_pending_marks(
                 ToolCallEndParams::builder()
                     .handle(&handle)
-                    .result(result.clone())
+                    .execution_result(execution_result.clone())
                     .data_opt(data)
                     .metadata_opt(end_metadata)
                     .build(),
@@ -795,11 +863,10 @@ pub async fn tool_call_execute(params: ToolCallExecuteParams) -> Result<Json> {
             )
             .await?;
             completion.disarm();
-            Ok(result)
+            Ok(execution_result)
         }
         Err(error) => {
-            let end_metadata =
-                metadata_with_otel_status(metadata, "ERROR", Some(error.to_string()));
+            let end_metadata = metadata_with_otel_error(metadata, &error);
             let _ = emit_tool_end_without_output(
                 &handle,
                 end_metadata,
