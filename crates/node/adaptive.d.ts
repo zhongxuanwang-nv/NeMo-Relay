@@ -6,6 +6,13 @@ import type { ConfigPolicy, ConfigDiagnostic, ConfigReport } from './plugin';
 
 export { ConfigPolicy, ConfigDiagnostic, ConfigReport };
 
+/** Supported LLM response-cache key derivation strategies. */
+export const ResponseCacheKeyStrategy: {
+  readonly ExactRequest: 'exact_request';
+  readonly Logical: 'logical';
+};
+export type ResponseCacheKeyStrategy = (typeof ResponseCacheKeyStrategy)[keyof typeof ResponseCacheKeyStrategy];
+
 /** Adaptive state backend selection. */
 export interface BackendSpec {
   kind: string;
@@ -63,7 +70,7 @@ export interface ResponseCacheConfig {
   priority?: number;
   bypassRate?: number;
   cacheNondeterministic?: boolean;
-  keyStrategy?: string;
+  keyStrategy?: ResponseCacheKeyStrategy;
   headerAllowlist?: string[];
   backend?: BackendSpec;
 }
@@ -75,7 +82,7 @@ interface ResponseCachePluginConfig {
   priority?: number;
   bypass_rate?: number;
   cache_nondeterministic?: boolean;
-  key_strategy?: string;
+  key_strategy?: ResponseCacheKeyStrategy;
   header_allowlist?: string[];
   backend?: BackendSpec;
 }

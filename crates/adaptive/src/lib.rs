@@ -58,6 +58,7 @@ pub use error::{AdaptiveError, Result};
 #[cfg(feature = "redis-backend")]
 pub use redis::RedisBackend;
 pub use response_cache::RESPONSE_CACHE_MARK;
+pub use response_cache::ResponseCacheKeyStrategy;
 pub use runtime::features::AdaptiveRuntime;
 pub use storage::erased::AnyBackend;
 pub use storage::memory::InMemoryBackend;

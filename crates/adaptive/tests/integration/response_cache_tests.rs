@@ -28,7 +28,8 @@ use nemo_relay::plugin::{
 };
 use nemo_relay_adaptive::plugin_component::{ComponentSpec, register_adaptive_component};
 use nemo_relay_adaptive::{
-    AcgComponentConfig, AdaptiveConfig, BackendSpec, ResponseCacheConfig, StateConfig,
+    AcgComponentConfig, AdaptiveConfig, BackendSpec, ResponseCacheConfig, ResponseCacheKeyStrategy,
+    StateConfig,
 };
 use serde_json::{Value as Json, json};
 use tokio::sync::Mutex;
@@ -711,7 +712,7 @@ async fn logical_strategy_reuses_across_reworded_tool_descriptions() {
     // diagnostics) and must reuse across a reworded tool description end-to-end.
     activate_cache(ResponseCacheConfig {
         namespace: "logical-key-integration-test".to_string(),
-        key_strategy: "logical".to_string(),
+        key_strategy: ResponseCacheKeyStrategy::Logical,
         ..ResponseCacheConfig::default()
     })
     .await;

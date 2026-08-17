@@ -9,6 +9,7 @@ helpers that summarize ACG observations into structured JSON payloads.
 """
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Literal, TypedDict
 
 from nemo_relay import JsonObject, ScopeHandle, UnsupportedBehavior
@@ -30,6 +31,12 @@ class ConfigReport(TypedDict):
     """Validation report returned by adaptive configuration helpers."""
 
     diagnostics: list[ConfigDiagnostic]
+
+class ResponseCacheKeyStrategy(str, Enum):
+    """Supported LLM response-cache key derivation strategies."""
+
+    EXACT_REQUEST: str
+    LOGICAL: str
 
 @dataclass(slots=True)
 class ConfigPolicy:
@@ -196,7 +203,7 @@ class ResponseCacheConfig:
         bypass_rate: Probability in ``[0.0, 1.0]`` of skipping the cache and running live.
         cache_nondeterministic: Cache nondeterministic requests too; ``False``
             caches only requests explicitly pinned deterministic (``temperature`` = 0).
-        key_strategy: Key strategy: ``"exact_request"`` or ``"logical"``.
+        key_strategy: Typed key derivation strategy.
         header_allowlist: Request headers folded into the key.
         backend: Cache storage backend (``in_memory`` or ``redis``).
     """
@@ -206,7 +213,7 @@ class ResponseCacheConfig:
     priority: int = ...
     bypass_rate: float = ...
     cache_nondeterministic: bool = ...
-    key_strategy: str = ...
+    key_strategy: ResponseCacheKeyStrategy = ...
     header_allowlist: list[str] = ...
     backend: BackendSpec = ...
 

@@ -970,7 +970,7 @@ fn null_text_system_block_does_not_collide_with_no_system() {
 
 fn logical_config() -> ResponseCacheConfig {
     ResponseCacheConfig {
-        key_strategy: KEY_STRATEGY_LOGICAL.to_string(),
+        key_strategy: ResponseCacheKeyStrategy::Logical,
         ..cache_all_config()
     }
 }

@@ -392,7 +392,7 @@ describe('adaptive helpers', () => {
       priority: 50,
       bypassRate: 0,
       cacheNondeterministic: false,
-      keyStrategy: 'exact_request',
+      keyStrategy: adaptive.ResponseCacheKeyStrategy.ExactRequest,
       headerAllowlist: [],
       backend: adaptive.inMemoryBackend(),
     });
@@ -409,6 +409,20 @@ describe('adaptive helpers', () => {
         backend: adaptive.inMemoryBackend(),
       },
     });
+  });
+
+  it('exports and serializes response-cache key strategy values', () => {
+    assert.deepEqual(adaptive.ResponseCacheKeyStrategy, {
+      ExactRequest: 'exact_request',
+      Logical: 'logical',
+    });
+    const spec = adaptive.ComponentSpec({
+      version: 1,
+      responseCache: {
+        keyStrategy: adaptive.ResponseCacheKeyStrategy.Logical,
+      },
+    });
+    assert.equal(spec.config.response_cache.key_strategy, 'logical');
   });
 
   it('serializes response-cache config at both native boundaries', () => {
